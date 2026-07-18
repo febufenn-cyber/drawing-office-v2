@@ -39,6 +39,7 @@ flowchart TB
     C3 -->|policy| C4
     WS -->|policy file, credential scope| C3
     WS -->|workspace keys| C6
+    C3 -->|gate timeouts| C5
     C5 -->|ApprovalRequest| UI
     UI -->|ApprovalResponse| C5
     C5 -->|tokens, ledger, fill| C6
@@ -57,7 +58,7 @@ The agent runtime submits an ActionProposal to the approval-gate, the single ent
 | P2 | action-resolver | module | Resolves a proposal against the current PageGraph into what it actually does: origin, method, endpoint, payload semantics, amount, tier, consequence. | P1 | local |
 | P3 | policy-store | store | Loads, validates, and serves the workspace policy file; refuses unsafe or malformed policies. | none | local |
 | P4 | policy-engine | class | Pure function from resolved action, policy, and budget snapshot to a Decision of named findings with a fail-closed verdict. | P1, P3 | local |
-| P5 | approval-gate | module | Sole execution path: orchestrates validate, resolve, evaluate, human approval, grant binding, ticket mint, dispatch, and logging. | P1, P2, P4, P6, P7 | local |
+| P5 | approval-gate | module | Sole execution path: orchestrates validate, resolve, evaluate, human approval, grant binding, ticket mint, dispatch, and logging. | P1, P2, P3, P4, P6, P7 | local |
 | P6 | capability-vault | store | Holds credentials, capability tokens, and the spend ledger; fills secrets into pages without exposing them. | P1 | local |
 | P7 | audit-log | store | Append-only, hash-chained, signed evidence log of every control-plane event, per workspace. | P1 | local |
 
@@ -77,6 +78,8 @@ classDiagram
         +target_node: string
         +snapshot_ref: SnapshotRef
         +declared: DeclaredIntent
+        +token_id: uuid or none
+        +secret_ref: string or none
         +task_ref: string
     }
     class DeclaredIntent {
@@ -100,13 +103,20 @@ classDiagram
         +form_digest: hex64 or none
         +method: string
         +endpoint: string or none
-        +payload_classes: list of FieldClass
+        +payload_classes: list of PayloadField
         +amount_minor: int or none
         +currency: string or none
         +entity_count: int
+        +destructive: bool
+        +token_id: uuid or none
+        +secret_ref: string or none
         +tier_effective: Tier
         +consequence_effective: Consequence
         +mismatches: list of string
+    }
+    class PayloadField {
+        +field_class: FieldClass
+        +secret_scope: string or none
     }
     class Finding {
         +severity: Verdict
@@ -116,12 +126,13 @@ classDiagram
     class Decision {
         +verdict: Verdict
         +findings: list of Finding
-        +resolved_ref: uuid
-        +policy_rev: int
+        +proposal_ref: uuid or none
+        +policy_rev: int or none
         +decided_at: iso8601
     }
     ActionProposal --> DeclaredIntent
     ActionProposal --> SnapshotRef
+    ResolvedAction --> PayloadField
     Decision --> Finding
 ```
 
@@ -131,10 +142,11 @@ Canonical serialization is deterministic JSON — sorted keys, no whitespace, UT
 
 ```text
 validate_proposal(raw_bytes):
- 1. IF raw_bytes does not parse as JSON: RETURN Decision(BLOCK, [SCHEMA_INVALID])
- 2. IF any field is missing, unknown, or out of enum: RETURN Decision(BLOCK, [SCHEMA_INVALID])
- 3. IF declared.tier is transact AND declared.amount_minor is none: mark amount undeclared
- 4. RETURN ActionProposal
+ 1. IF raw_bytes does not parse as JSON:
+      RETURN Decision(BLOCK, [SCHEMA_INVALID], proposal_ref: none, policy_rev: none)
+ 2. IF any field is missing, unknown, or out of enum:
+      RETURN Decision(BLOCK, [SCHEMA_INVALID], proposal_ref: parsed id or none, policy_rev: none)
+ 3. RETURN ActionProposal
 ```
 
 ### P2 — action-resolver
@@ -154,15 +166,16 @@ flowchart TB
 Rules, each a decision on this sheet:
 
 - Binding uses the stable node id from the referenced snapshot. A node absent from the snapshot, or a snapshot whose `nav_epoch` differs from the handle's current epoch, is a resolution failure — never a guess.
-- Actual effect derives from the node's affordance metadata in the PageGraph: enclosing form action and method for submit-class nodes, link target for navigation, event semantics for click and type. `payload_classes` classifies every field the action would transmit; a field whose value came from `fillSecret` classifies as `credential_ref`.
+- Actual effect derives from the node's affordance metadata in the PageGraph: enclosing form action and method for submit-class nodes, link target for navigation, event semantics for click and type. `payload_classes` classifies every field the action would transmit; a field whose value came from `fillSecret` reads the snapshot's mask label and classifies as `credential_ref` with `secret_scope` set to the filling SecretRef's scope.
 - Amount resolution reads the enclosing form's price and currency fields and the target's accessible name. An amount that cannot be resolved to minor units plus ISO-4217 currency is returned as none — unresolved, never estimated.
-- Detected consequence comes from an effect lexicon over resolved semantics: send, post, publish, delete, revoke, submit, and confirm map to irreversible; pay, buy, order, subscribe, and transfer map to monetary; all else reversible. Detected tier: read for pure navigation and extraction, interact for state-changing DOM actions, transact for monetary. Effective values are the maximum of declared and detected on each axis — the anti-under-declaration rule, mirroring `rampart/classify.py::Classification.effective_category`.
+- Detected consequence comes from an effect lexicon over resolved semantics: send, post, publish, delete, revoke, submit, and confirm map to irreversible; pay, buy, order, subscribe, and transfer map to monetary; all else reversible. Delete and revoke additionally set `destructive`. Detected tier: read for pure navigation and extraction, interact for state-changing DOM actions, transact for monetary. Effective values are the maximum of declared and detected on each axis — the anti-under-declaration rule, mirroring `rampart/classify.py::Classification.effective_category`.
 - `target_digest` is `digest` of the resolved node's subtree (tag, attributes, accessible name, geometry bucket). `form_digest` is `digest` of the enclosing form's field names and current values; none when no form encloses the target. `entity_count` is the number of distinct entities the action affects (list rows selected, messages addressed); 1 when singular.
+- `token_id` and `secret_ref` copy from the proposal unchanged; resolution neither invents nor drops them.
 - Resolution is deterministic: identical proposal plus identical snapshot yields a byte-identical ResolvedAction.
 
 ### P3 — policy-store
 
-Origin: SKELETON of `rampart/roe.py::ROE` and `load_roe`. Kept: the policy file is the single source of authorization truth, read only by deterministic code; validation refuses to load a file that would authorize nothing or everything. New: origins replace CIDRs, tier grants replace category lists, spending caps replace rate ceilings as the load-bearing limit.
+Origin: SKELETON of `rampart/roe.py::ROE` and `load_roe`. Kept: the policy file is the single source of authorization truth, read only by deterministic code; validation refuses to load a file with an empty scope, as `roe_from_dict` refuses an ROE that authorizes nothing. New: origins replace CIDRs, tier grants replace category lists, spending caps replace rate ceilings as the load-bearing limit, and the refusal set widens beyond Rampart's single empty-scope case.
 
 ```mermaid
 classDiagram
@@ -201,7 +214,7 @@ Load refusals, mirroring Rampart's empty-scope refusal: any OriginGrant of tier 
 
 ### P4 — policy-engine
 
-Origin: SKELETON of `rampart/policy.py::PolicyEngine.evaluate` and `_check_declared_target`. Kept: pure and side-effect-free with an injected clock; independent named checks each appending a Finding; verdict is the maximum severity across findings; declared-versus-actual cross-check as a first-class check. New: the two-axis tier-and-consequence posture and the browser-domain check set.
+Origin: SKELETON of `rampart/policy.py::PolicyEngine.evaluate` and `_check_declared_target`. Kept: independent named checks each appending a Finding; verdict is the maximum severity across findings; declared-versus-actual cross-check as a first-class check. Changed: Rampart's engine holds a mutable RateState and defaults to its own clock when none is injected; here the engine holds no mutable state and the clock is always supplied. New: the two-axis tier-and-consequence posture and the browser-domain check set.
 
 ```mermaid
 classDiagram
@@ -213,8 +226,16 @@ classDiagram
         +month_spent_minor: int
         +actions_last_min: int
         +origin_actions_last_min: int
+        +token: TokenState or none
+    }
+    class TokenState {
+        +token_id: uuid
+        +tier: Tier
+        +in_scope: bool
+        +live: bool
     }
     PolicyEngine --> BudgetSnapshot
+    BudgetSnapshot --> TokenState
 ```
 
 The check set. Each check is independent, has a stable machine code, and appends at most one Finding whose severity is at or above the stated floor. Verdict floors are tolerances in CONTRACTS & TOLERANCES.
@@ -223,18 +244,17 @@ The check set. Each check is independent, has a stable machine code, and appends
 |------|---------|---------------|
 | NO_POLICY | No valid policy loaded for the workspace. | BLOCK |
 | SCHEMA_INVALID | Proposal failed P1 validation. | BLOCK |
-| RESOLVE_FAILED | P2 could not bind the proposal to the referenced snapshot. | BLOCK |
-| SNAPSHOT_STALE | Snapshot nav_epoch differs from the handle's current epoch. | BLOCK |
+| RESOLVE_FAILED | P2 could not bind the proposal to the referenced snapshot, including a snapshot whose nav_epoch differs from the handle's current epoch. | BLOCK |
 | DECLARED_MISMATCH | Declared origin, tier, consequence, or amount disagrees with resolved values. | CONFIRM |
 | ORIGIN_FORBIDDEN | Resolved origin is in forbidden_origins. | BLOCK |
 | TIER_EXCEEDED | Effective tier above the origin's granted tier. | BLOCK |
-| TOKEN_INVALID | Tier at or above interact with no live in-scope capability token. | BLOCK |
+| TOKEN_INVALID | Effective tier at or above interact and the snapshot's token is none, not live, out of scope, or below the effective tier. | BLOCK |
 | IRREVERSIBLE | Effective consequence irreversible. | CONFIRM |
 | MONETARY | Effective consequence monetary, unconditionally. | CONFIRM |
 | AMOUNT_UNRESOLVED | Monetary action whose amount or currency resolved to none. | BLOCK |
-| CAP_EXCEEDED | Amount above per_action cap, or month_spent plus amount above monthly cap, or currency differs from cap currency. | BLOCK |
-| EXFIL_PATTERN | Payload carries a credential_ref field class to any origin other than that secret's scope. | BLOCK |
-| DESTRUCTIVE_BULK | Destructive semantics with entity_count above destructive_bulk_limit. | BLOCK |
+| CAP_EXCEEDED | Amount above per_action cap, above the token's budget_minor where present, month_spent plus amount above monthly cap, or currency differs from cap currency. | BLOCK |
+| EXFIL_PATTERN | Any credential_ref payload field whose secret_scope differs from the resolved origin. | BLOCK |
+| DESTRUCTIVE_BULK | ResolvedAction destructive with entity_count above destructive_bulk_limit. | BLOCK |
 | RATE_EXCEEDED | Budget snapshot at or above actions_per_min or per_origin_per_min. | BLOCK |
 | CROSS_WORKSPACE | Handle's workspace differs from the proposal's workspace. | BLOCK |
 | OK | No other finding raised. | ALLOW |
@@ -250,7 +270,7 @@ evaluate(resolved, budget, now):
  6. RETURN Decision(verdict, findings, resolved.proposal_ref, policy.policy_rev, now)
 ```
 
-Ambiguity escalates, never passes: an unclassifiable consequence evaluates as irreversible; an unclassifiable tier evaluates as interact. The engine never mutates budget counters; the gate owns state.
+Ambiguity escalates, never passes: an unclassifiable consequence evaluates as irreversible; an unclassifiable tier evaluates as interact. The engine never mutates state: the gate assembles each BudgetSnapshot, maintaining the rolling 60-second dispatch counters itself and incrementing them at dispatch, while P6 supplies month_spent_minor and the TokenState for the proposal's token_id.
 
 ### P5 — approval-gate
 
@@ -295,21 +315,30 @@ sequenceDiagram
                     G->>A: approval.granted
                 end
             end
-            G->>R: re-resolve against fresh snapshot
-            alt binding broken
-                G->>A: grant.invalidated
-                G->>U: re-approval with change diff
-            else binding holds
-                G->>A: action.dispatched durable
-                G->>V: debit ledger IF monetary
-                opt kind fill_secret
-                    G->>V: fill(handle, node, secret_ref, ticket)
-                    V->>S: fillSecret
+            opt verdict ALLOW, or CONFIRM with a live grant
+                G->>R: re-resolve against fresh snapshot
+                alt binding broken
+                    G->>A: grant.invalidated
+                    G->>U: re-approval with change diff
+                else binding holds
+                    G->>A: action.dispatched durable
+                    G->>V: debit ledger IF monetary
+                    alt kind fill_secret
+                        G->>V: fill(handle, node, secret_ref, ticket)
+                        V->>S: fillSecret
+                        V-->>G: FillResult
+                    else any other kind
+                        G->>S: act(handle, action, ticket)
+                        S-->>G: ActResult
+                    end
+                    alt result not ok
+                        G->>A: action.result
+                        G-->>L2: error result, as data
+                    else result ok
+                        G->>A: action.result
+                        G-->>L2: result, as data
+                    end
                 end
-                G->>S: act(handle, action, ticket)
-                S-->>G: ActResult
-                G->>A: action.result
-                G-->>L2: ActResult, as data
             end
         end
     end
@@ -345,7 +374,7 @@ stateDiagram-v2
     Consumed --> [*]
 ```
 
-Invalidation is checked by recomputing the StateBinding from a fresh snapshot immediately before dispatch. Any committed navigation (nav_epoch change), mutation of the target subtree or enclosing form values, re-resolved amount change, policy reload, workspace mismatch, elapsed TTL, or prior consumption refuses dispatch, appends `grant.invalidated` with the reason code, and re-enters CONFIRM with a diff of what changed. Grants are single-use; replay is `CONSUMED`.
+Invalidation is checked by recomputing the StateBinding from a fresh snapshot immediately before dispatch. Any committed navigation (nav_epoch change), mutation of the target subtree or enclosing form values, re-resolved amount change, policy reload, workspace mismatch, elapsed TTL, or prior consumption refuses dispatch, appends `grant.invalidated` with the reason code, and re-enters CONFIRM with a diff of what changed. Grants are single-use: a dispatch citing a consumed grant refuses, logs `grant.invalidated` with reason CONSUMED, and re-enters CONFIRM.
 
 ```text
 dispatch(decision, grant_or_none):
@@ -359,12 +388,14 @@ dispatch(decision, grant_or_none):
  6. IF resolved2 is monetary: P6.debit(workspace, amount_minor, currency, grant_id)
  7. ticket := mint ExecutionTicket { ticket_id, action_digest(resolved2),
               nav_epoch, expiry: now + 2000 ms, single_use, mac }
- 8. result := RenderSurface.act(handle, action, ticket)
+ 8. IF resolved2.kind is fill_secret:
+      result := P6.fill(handle, resolved2 target node, resolved2.secret_ref, ticket)
+    ELSE: result := RenderSurface.act(handle, action, ticket)
  9. mark grant consumed; append action.result
 10. RETURN result as data
 ```
 
-The ticket `mac` is an HMAC over the ticket body, keyed by a per-session key shared between the gate and RenderSurface at surface construction and unreadable by L2. The approval sheet contract (pixels are L6's): ApprovalRequest carries request_id, workspace_id, origin, kind, consequence_effective, amount_minor and currency when monetary, target accessible name labeled as page content, finding codes, and expires_at; ApprovalResponse carries request_id, approved, operator_note. Strings originating in the PageGraph are always labeled page content in the request; approval binds to the request_id only — there are no blanket approvals.
+The ticket `mac` is an HMAC over the ticket body, keyed by a per-session key shared between the gate and RenderSurface at surface construction and unreadable by L2. The approval sheet contract (pixels are L6's): ApprovalRequest carries request_id, workspace_id, origin, kind, consequence_effective, amount_minor and currency when monetary, target accessible name labeled as page content, finding codes, and expires_at; ApprovalResponse carries request_id, approved, operator_ref, operator_note; operator_ref lands in the grant and the approval.granted and budget.credit audit events. Strings originating in the PageGraph are always labeled page content in the request; approval binds to the request_id only — there are no blanket approvals.
 
 ### P6 — capability-vault
 
@@ -379,7 +410,6 @@ classDiagram
         +tier: Tier
         +budget_minor: int or none
         +expiry: iso8601
-        +approval_required: bool
     }
     class SecretRef {
         +ref: string
@@ -408,7 +438,7 @@ classDiagram
 
 Secrets are stored encrypted at rest under a per-workspace key provisioned by L3, in a local file with owner-only permissions — the same posture as `rampart/audit.py::load_or_create_key`. A SecretRef is an opaque handle scoped to one origin; `fill` streams the secret value to `RenderSurface.fillSecret` and returns only a boolean FillResult. The secret value appears in no return value, no log field, no PageGraph, and no L2-visible channel; the audit event records the SecretRef only. `fill` requires a valid ExecutionTicket — a fill is a gated action like any other.
 
-The spend ledger is append-only. `debit` is called by the gate at dispatch, before the ActResult returns — a failed payment still consumes budget until an operator-approved credit reverses it, so the cap can never be overspent by racing failures. `month_spent` sums entries in the current UTC calendar month and feeds the engine's BudgetSnapshot.
+The spend ledger is append-only. `debit` is called by the gate at dispatch, before the action executes — a failed payment still consumes budget until an operator-approved credit reverses it, so the cap can never be overspent by racing failures. `month_spent` sums entries in the current UTC calendar month and feeds the engine's BudgetSnapshot.
 
 ### P7 — audit-log
 
@@ -509,7 +539,7 @@ P6 — capability-vault:
 |-----------|--------------|------------------|-----------|---------------|--------------------------------|
 | fill(handle, node_id, secret_ref, ticket) | in-scope SecretRef, valid ticket | Streams the secret to RenderSurface.fillSecret; returns FillResult boolean only. | Secret bytes in returns, logs, PageGraphs, and L2 channels equal zero; exact | Op 60, Op 90 | Any observable secret byte fails inspection; out-of-scope or ticketless fills are refused and logged vault.fill not-ok. |
 | mint, check | workspace-scoped token requests | Issues and verifies CapabilityToken against origin, tier, expiry. | check is exact: expired, out-of-scope, or wrong-tier tokens verify false | Op 60 | A token verifying outside its scope fails inspection; the engine's TOKEN_INVALID depends on this exactness. |
-| debit, month_spent | gate-originated debits | Appends LedgerEntry at dispatch; sums the current UTC month. | Ledger append-only; sums exact to the minor unit; debit precedes ActResult return | Op 60, Op 90 | Arithmetic drift or a mutable ledger breaks the spend guarantee; inspection rejects both. |
+| debit, month_spent | gate-originated debits | Appends LedgerEntry at dispatch; sums the current UTC month. | Ledger append-only; sums exact to the minor unit; debit durable before the call returns | Op 60, Op 90 | Arithmetic drift or a mutable ledger breaks the spend guarantee; inspection rejects both. |
 
 P7 — audit-log:
 
@@ -525,7 +555,7 @@ RenderSurface additions (L0 boundary; the parent interface lacks these, so they 
 |-----------|--------------|------------------|-----------|---------------|--------------------------------|
 | act(handle, action, ticket) | action targeting a stable node id; ExecutionTicket | Executes only with a valid ticket: unexpired, unconsumed, MAC-valid, action digest and nav_epoch matching. | Rejection of invalid tickets exact; ticket key unreadable by L2 | Op 70, Op 80, Op 90 | act without a valid ticket returns TICKET_REJECTED and performs nothing; a bypass fails the Op 90 battery. |
 | fillSecret(handle, node_id, secret_ref) | vault-initiated stream | Fills the field from the vault stream; returns FillResult without the value. | Value absent from return and from subsequent snapshots, which mask vault-filled fields; exact | Op 60, Op 90 | A snapshot exposing a filled value leaks the secret to L1 and L2; the battery fails on any exposure. |
-| snapshot(handle) additions | any page | PageGraph carries nav_epoch, workspace_id, and per-node stable digests. | Fields present on every snapshot; nav_epoch monotonic per handle; exact | Op 40, Op 80 | Missing fields make resolution and grant binding impossible; the resolver blocks rather than guesses. |
+| snapshot(handle) additions | any page | PageGraph carries nav_epoch, workspace_id, and per-node stable digests; vault-filled fields are masked and labeled with the filling SecretRef's scope. | Fields, masking, and scope labels present on every snapshot; nav_epoch monotonic per handle; exact | Op 40, Op 60, Op 80 | Missing fields make resolution and grant binding impossible; the resolver blocks rather than guesses. |
 | observe(handle) additions | any page | Navigation events carry the new nav_epoch. | Epoch in events equals epoch in next snapshot; exact | Op 80 | Epoch skew would let a stale grant survive navigation; the invalidation battery falsifies this. |
 
 Layer boundaries (L1, L2, L3, L6):
@@ -546,7 +576,7 @@ Layer boundaries (L1, L2, L3, L6):
 | 30 | Implement P3 policy-store: schema, load refusals, policy_rev. | language stdlib, unit test runner | Valid policy loads and policy.loaded is emitted; transact-without-caps, unknown-key, empty-workspace, and bad-currency files each refuse with policy.rejected; rev strictly increments across reloads; per-workspace key and policy separation verified. |
 | 40 | Implement P2 action-resolver over recorded PageGraph fixtures with nav_epoch, digests, and payment forms. | language stdlib, fixture corpus, unit test runner | Byte-identical ResolvedAction across repeated runs; declared-versus-actual fixture lists every mismatch; payment fixture with ambiguous price resolves amount to none; under-declared fixtures never lower effective tier or consequence. |
 | 50 | Implement P4 policy-engine and the full check set. | language stdlib, unit test runner | One vector per check code triggers exactly that code and floor; verdict equals max severity on mixed vectors; identical inputs give identical Decisions; unclassifiable fixtures escalate; every verdict-floor row in CONTRACTS holds. |
-| 60 | Implement P6 capability-vault: encrypted store, tokens, fill against a stub surface, ledger. | language stdlib, AEAD cipher primitive, unit test runner | mint and check enforce scope, tier, expiry; fill returns only a boolean and the secret value appears in no return, log, or masked stub snapshot; ledger sums exact and append-only; debit precedes result return. |
+| 60 | Implement P6 capability-vault: encrypted store, tokens, fill against a stub surface, ledger. | language stdlib, AEAD cipher primitive, unit test runner | mint and check enforce scope, tier, expiry; fill returns only a boolean and the secret value appears in no return, log, or masked stub snapshot; ledger sums exact and append-only; debit durable before the call returns. |
 | 70 | Implement P5 approval-gate and wire the full pipeline to a stub RenderSurface with tickets. | language stdlib, stub surface harness, unit test runner | ALLOW path dispatches exactly once with a valid ticket; BLOCK path records zero act calls; CONFIRM without grant never dispatches; approval timeout auto-denies at 600 s on a fake clock; ApprovalRequests label page strings; late responses discarded. |
 | 80 | Grant-invalidation and ordering battery with fault injection on the stub surface and fake clock. | fault-injection harness, fake clock, unit test runner | Each invalidation vector — navigation, target mutation, form mutation, amount swap, policy reload, workspace switch, TTL expiry, grant reuse, ticket reuse, ticket expiry, epoch skew — refuses dispatch and logs grant.invalidated or TICKET_REJECTED; every act call is preceded by its durable action.dispatched record. |
 | 90 | Adversarial battery: scripted fully-jailbroken proposer replaying attack vectors end to end. | adversarial harness, stub surface with leak detectors, unit test runner | Injected-page credential-read stream leaks zero secret bytes; declared-benign exfil POST blocks on EXFIL_PATTERN; cap-evasion stream of small payments never exceeds monthly cap; forged and absent grants never reach act; cross-workspace handles block; bulk-delete above limit blocks; ticket forgery rejected by MAC. |

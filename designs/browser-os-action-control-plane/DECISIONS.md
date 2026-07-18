@@ -71,3 +71,7 @@ could become a decision is on the sheet; this file holds what could not.
 - **Regex danger-flags on raw payloads** (Rampart's `_DANGER` table).
   Replaced by classification over resolved PageGraph semantics; raw-string
   pattern matching on web payloads is both noisy and evadable.
+- **`approval_required` on capability tokens.** The parent doc's token shape
+  carries it; dropped here. Whether a human gate is required derives from the
+  consequence axis and policy, never from a token flag a planner could select
+  against.

@@ -35,7 +35,7 @@ REQUIRED_SECTIONS = [
 ]
 
 FENCE_RE = re.compile(r'^\s{0,3}`{3,}')
-MERMAID_FENCE_RE = re.compile(r'^\s{0,3}`{3,}[ \t]?mermaid\b')
+MERMAID_FENCE_RE = re.compile(r'^\s{0,3}`{3,}[ \t]*mermaid\b')
 H2_RE = re.compile(r'^##\s+')
 H3_RE = re.compile(r'^###\s+')
 H3_DETAIL_RE = re.compile(r'^###\s+(P[0-9]+)\b')
@@ -211,9 +211,10 @@ def check_front_matter_values(entries):
                        'supersedes neither none nor DO-NNN'))
     status = get('status')
     reviewed = get('reviewed_by')
-    if status and reviewed and status[0] == 'released' and reviewed[0] == 'none':
+    if (status and reviewed and status[0] != 'draft'
+            and reviewed[0] == 'none'):
         errors.append((reviewed[1], 'E115',
-                       'status released but reviewed_by is none'))
+                       'reviewed_by is none but status is not draft'))
     return errors
 
 
@@ -575,7 +576,10 @@ def check_register(per_file):
             if nxt not in color:
                 continue
             if color[nxt] == GRAY:
-                cyclic.update(stack + [nxt])
+                if nxt in stack:
+                    cyclic.update(stack[stack.index(nxt):])
+                else:
+                    cyclic.add(nxt)
             elif color[nxt] == WHITE:
                 visit(nxt, stack + [nxt])
         color[node] = BLACK
