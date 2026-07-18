@@ -16,15 +16,15 @@ imports engine or Electron code.** Perception and action cross the
 | DO | Title | Layer | Responsibility | Depends on | Status |
 |----|-------|-------|----------------|------------|--------|
 | DO-012 | Browser OS Action Control Plane | L4 | Deterministic authorization and evidence between the agent and any consequential action. | DO-013, DO-014, DO-019 | drafted |
-| DO-013 | Render Surface Engine Boundary | L0 | Own the engine; expose pages only through RenderSurface. | none | planned |
-| DO-014 | PageGraph Perception Model | L1 | Turn any page into typed, stable-id structured data and affordances. | DO-013 | planned |
-| DO-015 | Site Adapter Compiler | L1 | Compile an origin into typed, self-testing tools with provenance. | DO-013, DO-014, DO-017 | planned |
-| DO-016 | Task DAG Executor | L2 | Execute task graphs with per-step checkpoints and crash-resume. | DO-012, DO-013, DO-019 | planned |
-| DO-017 | Model Router | L2 | Route each role to a model; hold BYO keys; keep the verifier independent. | DO-019 | planned |
-| DO-018 | Skill Compiler and Library | L2 | Compile successful trajectories into verified, replayable skills. | DO-013, DO-016, DO-017, DO-019 | planned |
-| DO-019 | Workspace and Memory Store | L3 | Persist workspaces and the episodic, entity, and skill stores, encrypted and partitioned. | none | planned |
-| DO-020 | Agent Orchestration Layer | L5 | Fan out agents, enforce budgets, and run scheduled and event triggers. | DO-016, DO-019 | planned |
-| DO-021 | Interface Shell | L6 | Intent box, task cards, approval sheet, ambient sidebar. | DO-012, DO-016, DO-019 | planned |
+| DO-013 | Render Surface Engine Boundary | L0 | Own the engine; expose pages only through RenderSurface. | none | drafted |
+| DO-014 | PageGraph Perception Model | L1 | Turn any page into typed, stable-id structured data and affordances. | DO-013 | drafted |
+| DO-015 | Site Adapter Compiler | L1 | Compile an origin into typed, self-testing tools with provenance. | DO-013, DO-014, DO-017 | drafted |
+| DO-016 | Task DAG Executor | L2 | Execute task graphs with per-step checkpoints and crash-resume. | DO-012, DO-013, DO-019 | drafted |
+| DO-017 | Model Router | L2 | Route each role to a model; hold BYO keys; keep the verifier independent. | DO-019 | drafted |
+| DO-018 | Skill Compiler and Library | L2 | Compile successful trajectories into verified, replayable skills. | DO-013, DO-016, DO-017, DO-019 | drafted |
+| DO-019 | Workspace and Memory Store | L3 | Persist workspaces and the episodic, entity, and skill stores, encrypted and partitioned. | none | drafted |
+| DO-020 | Agent Orchestration Layer | L5 | Fan out agents, enforce budgets, and run scheduled and event triggers. | DO-016, DO-019 | drafted |
+| DO-021 | Interface Shell | L6 | Intent box, task cards, approval sheet, ambient sidebar. | DO-012, DO-016, DO-019 | drafted |
 
 ## Manufacture order
 
