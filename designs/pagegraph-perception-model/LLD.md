@@ -50,7 +50,7 @@ flowchart TB
     P9 -->|PageGraph| ADP
 ```
 
-RenderSurface hands the pagegraph-builder one snapshot — DOM, accessibility tree, structured-data payload, nav_epoch, and workspace_id. The builder drives the accessibility-normalizer to produce the typed spine, runs the stable-id-assigner over it, fuses content-extractor text, structured-data-parser entities, and affordance-inventory controls onto the spine nodes, computes a per-node digest through the node-digest function, and stamps provenance, nav_epoch, and workspace_id from the snapshot. When the DOM path fails a quality gate the builder falls back to vision. The resolver, the adapter compiler, and the executor and agent runtime beyond them read the emitted PageGraph by stable node id and never touch raw HTML.
+RenderSurface hands the pagegraph-builder one snapshot — DOM, accessibility tree, structured-data payload, url, origin, nav_epoch, and workspace_id. The builder drives the accessibility-normalizer to produce the typed spine, runs the stable-id-assigner over it, fuses content-extractor text, structured-data-parser entities, and affordance-inventory controls onto the spine nodes, computes a per-node digest through the node-digest function, and stamps provenance, nav_epoch, and workspace_id from the snapshot. When the DOM path fails a quality gate the builder falls back to vision. The resolver, the adapter compiler, and the executor and agent runtime beyond them read the emitted PageGraph by stable node id and never touch raw HTML.
 
 ## BILL OF MATERIALS
 
@@ -91,6 +91,7 @@ classDiagram
         +value_mask: string or none
         +geometry_bucket: GeometryBucket
         +affordance: Affordance or none
+        +attrs: object
         +children_ids: list of string
         +digest: hex64
         +provenance: Provenance
@@ -101,8 +102,6 @@ classDiagram
         +action_target: string or none
         +field_class: FieldClass or none
         +secret_scope: string or none
-        +enabled: bool
-        +required: bool
     }
     class Entity {
         +entity_type: string
@@ -134,11 +133,12 @@ flowchart TB
     MAP --> DROP["drop hidden and presentational nodes"]
     DROP --> NAME["normalize accessible name: trim, collapse whitespace"]
     NAME --> GEO["bucket bounding box to the fixed grid"]
-    GEO --> PROV["stamp provenance source accessibility with timestamp"]
+    GEO --> ATTR["record stable and volatile attributes into attrs"]
+    ATTR --> PROV["stamp provenance source accessibility with timestamp"]
     PROV --> SPINE["typed node spine"]
 ```
 
-The accessibility tree is the spine because it is already a tree of typed, named nodes with the presentational noise removed by the engine. Role mapping is a total function into the closed `NodeRole` enum; an unmapped AX role becomes `unknown` rather than a guess. Geometry is quantized to a sixteen-pixel grid so that sub-pixel and scroll shifts do not perturb it. Normalization is deterministic: identical accessibility input yields an identical spine. Every emitted node carries provenance to its originating accessibility node.
+The accessibility tree is the spine because it is already a tree of typed, named nodes with the presentational noise removed by the engine. Role mapping is a total function into the closed `NodeRole` enum; an unmapped AX role becomes `unknown` rather than a guess. Geometry is quantized to a sixteen-pixel grid so that sub-pixel and scroll shifts do not perturb it. Each node records its stable and volatile attributes into the `attrs` field, the durable subset feeding the stable id and the full set feeding the digest. Normalization is deterministic: identical accessibility input yields an identical spine. Every emitted node carries provenance to its originating accessibility node.
 
 ### P3 — content-extractor
 
@@ -186,7 +186,7 @@ infer_field_class(node):
  3. IF input type is one of email, tel, url: RETURN identifier
  4. IF name or label matches the payment lexicon: RETURN payment
  5. IF name or label matches the address lexicon: RETURN address
- 6. IF role is searchbox OR name matches the search lexicon: RETURN search
+ 6. IF name matches the search lexicon: RETURN search
  7. IF role is textbox OR the node is a text input: RETURN text
  8. RETURN free_form
 ```
@@ -246,7 +246,7 @@ digest(node):
  2. RETURN SHA-256(body)
 ```
 
-The digest covers precisely what the id excludes — geometry bucket and current values — so a mutation invisible to the id is visible to the digest. It is byte-identical for equal subtrees.
+The digest covers precisely what the id excludes — geometry bucket and current values — so a mutation invisible to the id is visible to the digest. It is byte-identical for equal subtrees. The graph-level `digest_root` is the SHA-256 over every node digest in canonical node order, so any node change moves the root; the builder computes and stamps it before validate.
 
 ### P8 — vision-fallback
 
@@ -328,10 +328,13 @@ build(snapshot):
       attach each fact to its spine node with provenance source and timestamp
  5. LOOP over every node in spine:
       node.digest := P7.digest(node)
- 6. graph := PageGraph(spine, entities, nav_epoch: snapshot.nav_epoch,
-                       workspace_id: snapshot.workspace_id, captured_at: snapshot.ts)
- 7. IF P1.validate(graph) is reject: ERROR invalid_graph
- 8. RETURN graph
+ 6. digest_root := SHA-256 over the node digests in canonical node order
+ 7. graph := PageGraph(spine, entities, nav_epoch: snapshot.nav_epoch,
+                       workspace_id: snapshot.workspace_id, captured_at: snapshot.ts,
+                       url: snapshot.url, origin: snapshot.origin,
+                       digest_root: digest_root)
+ 8. IF P1.validate(graph) is reject: ERROR invalid_graph
+ 9. RETURN graph
 ```
 
 Every fused fact attaches to a spine node; an orphan fact is a resolution failure, not a floating record. `nav_epoch` and `workspace_id` are copied from the snapshot unchanged and are the fields DO-012 and DO-013 bind against.
@@ -393,13 +396,13 @@ P9 — pagegraph-builder:
 |-----------|--------------|------------------|-----------|---------------|--------------------------------|
 | build(snapshot) | snapshot with DOM, accessibility tree, structured data, nav_epoch, workspace_id | Drives normalization, id assignment, fusion, digesting, and provenance stamping into one typed PageGraph, or routes to vision on gate failure. | Identical snapshot yields a byte-identical PageGraph; nav_epoch and workspace_id equal the snapshot values; every fact provenance-tagged; exact | Op 90, Op 120 | Nondeterminism or a dropped provenance link is rejected at inspection; consumers never receive an untraceable fact. |
 | fusion integrity | multi-source snapshot | Attaches every content, entity, and affordance fact to a spine node addressable by stable node_id. | Zero orphan facts; every node addressable by stable node_id; exact | Op 90 | An orphan fact has no provenance target; inspection rejects any fact not bound to a spine node. |
-| build latency | snapshots up to 20000 nodes | Returns the PageGraph within the latency budget. | p99 at or below 150 ms on the Op 110 corpus | Op 110 | Over-budget construction stalls every consumer; the op rejects the build until within budget. |
+| build latency | snapshots up to 20000 nodes | Returns the PageGraph within the latency budget. | p99 at or below 150 ms and peak resident memory at or below 512 MB on the Op 110 20000-node corpus | Op 110 | Over-budget construction stalls every consumer; the op rejects the build until within budget. |
 
 RenderSurface additions consumed (DO-013 boundary; this sheet reads them, DO-013 owns them):
 
 | Operation | Input domain | Nominal behavior | Tolerance | Inspection op | Failure mode outside tolerance |
 |-----------|--------------|------------------|-----------|---------------|--------------------------------|
-| snapshot(handle) raw material | any open page handle | Supplies DOM, accessibility tree, structured-data payload, nav_epoch, and workspace_id as the sole page input above L0. | nav_epoch monotonic per handle; workspace_id present on every snapshot; exact | Op 90 | Missing nav_epoch or workspace_id makes id and grant binding impossible; the builder blocks or falls back rather than guess. |
+| snapshot(handle) raw material | any open page handle | Supplies DOM, accessibility tree, structured-data payload, url, origin, nav_epoch, and workspace_id as the sole page input above L0. | nav_epoch monotonic per handle; workspace_id, url, and origin present on every snapshot; exact | Op 90 | Missing nav_epoch or workspace_id makes id and grant binding impossible; the builder blocks or falls back rather than guess. |
 | screenshot(handle, marked) | pages failing the DOM gate | Returns a set-of-marks overlay image for the vision path. | Marks numbered one through n stable within a capture; exact | Op 80 | An unstable overlay yields unstable mark ids; inspection checks numbering within a capture. |
 | import boundary | every module in the subsystem | Consumes page state only through RenderSurface snapshot and screenshot outputs. | Zero engine or Electron symbols imported anywhere in the subsystem; exact | Op 90 | An engine import couples perception to the substrate and breaks swappability; inspection scans the import graph. |
 
@@ -423,7 +426,7 @@ Consumer boundary (DO-012 resolver, DO-015 adapter compiler, DO-016 executor, L2
 | 80 | Implement P8 vision-fallback against a marked-screenshot stub and a vision-model stub. | language stdlib, screenshot fixture corpus, vision-model stub, unit test runner | Set-of-marks nodes numbered one through n stable within a capture; each mark node carries a click or type affordance and provenance source vision; the path runs only when the DOM quality gate reports fail. |
 | 90 | Implement P9 pagegraph-builder and wire the full pipeline over recorded snapshots. | language stdlib, snapshot fixture corpus, unit test runner | Identical snapshot yields a byte-identical PageGraph; nav_epoch and workspace_id equal the snapshot values; every node and entity carries provenance with a source node and timestamp; every fused fact attaches to a spine node with no orphans; the PageGraph exposes no raw HTML field; no module imports engine or Electron symbols and the only page input is RenderSurface snapshot and screenshot. |
 | 100 | Drift and stability battery over minor-perturbation snapshot pairs. | fault-injection fixture corpus, unit test runner | Across attribute churn, sibling insertion and removal, and geometry shift, at least 0.98 of durable nodes retain their id; a node whose content or geometry bucket changes gets a changed digest; a node whose durable signals are unchanged keeps its id. |
-| 110 | Latency and throughput measurement over reference corpora. | benchmark harness with high-resolution clock | p99 build measured at or below 150 ms on 20000-node snapshots; memory within the stated bound. |
+| 110 | Latency and throughput measurement over reference corpora. | benchmark harness with high-resolution clock | p99 build measured at or below 150 ms on 20000-node snapshots; peak resident memory at or below the stated 512 MB bound. |
 | 120 | Provenance, determinism, and fallback battery end to end. | adversarial fixture corpus, vision-model stub, unit test runner | Every extracted fact resolves to a source node and timestamp; degenerate and canvas-only fixtures trigger the vision path exactly once and produce a typed graph; a fixture with a populated accessibility tree never triggers the vision path; repeated runs over the corpus are byte-identical. |
 
 ## REVISION HISTORY

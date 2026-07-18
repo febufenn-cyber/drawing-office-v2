@@ -42,8 +42,12 @@ flowchart TB
     P1 -->|subscribe| P7
     P3 -->|surface plus CDP| P4
     P1 -->|snapshot, act, capture| P4
-    P6 -->|dedicated fill channel| P4
-    P7 -->|nav, network, mutation events| P4
+    P4 -->|read epoch, workspace| P2
+    P5 -->|read epoch| P2
+    P7 -->|set epoch| P2
+    P7 -->|subscribe engine events| P4
+    P4 -->|masked query| P6
+    P6 -->|dedicated fill channel| ENG
     P4 -->|CDP over debugger| ENG
 ```
 
@@ -59,7 +63,7 @@ The agent runtime opens a page through the render-surface-contract, the single e
 | P4 | cdp-driver | module | The general engine touchpoint: pulls the page graph, injects input by stable node id, and captures pixels over CDP. | P2, P6 | local |
 | P5 | ticket-verifier | module | Verifies an ExecutionTicket against the per-session key, expiry, single-use state, action digest, and nav_epoch. | P2 | local |
 | P6 | secret-fill-channel | module | Streams a vault secret into a field over a dedicated channel without returning it and marks the field masked. | none | local |
-| P7 | event-multiplexer | module | Multiplexes engine events into one ordered stream and assigns a new nav_epoch on committed navigation. | P2 | local |
+| P7 | event-multiplexer | module | Multiplexes engine events into one ordered stream and assigns a new nav_epoch on committed navigation. | P2, P4 | local |
 
 ## DETAIL DRAWINGS
 
@@ -91,7 +95,6 @@ classDiagram
         +action_digest: hex64
         +nav_epoch: int
         +expiry: iso8601
-        +single_use: bool
         +mac: hex
     }
     RenderSurface --> WorkspaceCtx
@@ -154,7 +157,7 @@ A partition is created once per workspace and reused for every surface in that w
 
 ### P4 — cdp-driver
 
-The general engine touchpoint. It reads the DOM and accessibility tree, computes a per-node stable digest, stamps nav_epoch and workspace_id onto the graph, injects input addressed by stable node id, and captures pixels with the set-of-marks overlay. It consults P6 so vault-filled fields carry no value.
+The general engine touchpoint. It reads the DOM and accessibility tree, computes a per-node stable digest, stamps nav_epoch and workspace_id onto the graph, injects input addressed by stable node id, and captures pixels with the set-of-marks overlay. It consults P6 so vault-filled fields carry no value. It also opens the raw engine event feed, so P7 subscribes to navigation, network, and mutation events through the driver rather than touching the engine itself.
 
 ```mermaid
 sequenceDiagram
@@ -291,6 +294,7 @@ P4 — cdp-driver:
 | pull_graph(surface) | an attached surface | Reads DOM and AX tree, computes per-node digests, stamps nav_epoch and workspace_id, applies the P6 mask set. | Identical DOM yields identical digests; masked fields carry no value; p99 at or below 250 ms on a 20000-node graph | Op 40, Op 100 | A digest that varies on identical DOM breaks ticket binding and fails inspection. |
 | inject(surface, node_id, input) | node_id whose digest matches the last snapshot | Dispatches input to the digest-matching node. | Targets only the digest-matching node; a raw selector is rejected; exact | Op 40, Op 80 | A selector-addressed action or a mismatched node is rejected before any engine call. |
 | capture(surface, marked) | an attached surface; marked boolean | Captures pixels; overlays set-of-marks when marked. | Overlay marks map to last snapshot node ids; exact | Op 40 | A mark resolving to no node fails inspection. |
+| subscribe_events(surface) | an attached surface | Exposes the raw engine event feed for the surface so P7 consumes navigation, network, and mutation events. | Every engine event on the surface is delivered exactly once in occurrence order; exact | Op 40, Op 50 | A dropped or duplicated engine event leaves P7 unable to order the stream and fails inspection. |
 
 P5 — ticket-verifier:
 
@@ -321,7 +325,7 @@ Engine boundary and caller layers (the L0 invariant and the external contracts a
 | engine swap | a second driver behind the contract | Replacing the driver changes only L0 parts and leaves the RenderSurface contract unchanged. | The acceptance suite passes on both drivers with no change above L0; exact | Op 110 | A contract that shifts on engine swap fails inspection; the boundary would leak. |
 | DO-012 ticket protocol | act and fillSecret from the action control plane | The gate calls act and fillSecret with an ExecutionTicket bound to the action digest and nav_epoch. | Every act and fillSecret requires a valid ticket; the session key is shared once at construction; exact | Op 20, Op 70 | A ticketless call performs nothing; a leaked key fails inspection. |
 | DO-014 perception protocol | snapshot, screenshot, observe from perception | Perception reads pages only through the contract; PageGraph is the only page representation crossing to L1. | Perception imports no engine symbol; raw HTML never crosses the boundary; exact | Op 110 | A perception path reaching the engine directly fails the import-graph inspection. |
-| DO-019 provisioning | workspace open | The workspace manager supplies the WorkspaceCtx with the workspace_id and partition key. | A surface opens only with a valid workspace-scoped ctx; exact | Op 60 | A ctx without a workspace-scoped key opens no surface. |
+| DO-019 provisioning | workspace open | The workspace manager supplies the WorkspaceCtx with the workspace_id and partition key. | A surface opens only with a valid workspace-scoped ctx; exact | Op 70 | A ctx without a workspace-scoped key opens no surface. |
 
 ## PROCESS PLAN
 
@@ -332,8 +336,8 @@ Engine boundary and caller layers (the L0 invariant and the external contracts a
 | 30 | Implement P6 secret-fill-channel against a stub surface with a mask registry. | language stdlib, stub surface harness, unit test runner | fill streams to the stub and returns only a boolean; the secret value appears in no return, log, event, or masked stub snapshot; the mask registry records the node and masks it until navigation clears the field. |
 | 40 | Implement P4 cdp-driver over recorded engine fixtures with digests and forms. | language stdlib, CDP fixture corpus, unit test runner | Identical DOM yields identical per-node digests; snapshot stamps nav_epoch and workspace_id and masks P6-marked fields; screenshot marks map one-to-one to snapshot node ids; inject targets the digest-matching node and rejects a raw selector. |
 | 50 | Implement P7 event-multiplexer over navigation fixtures. | language stdlib, fixture corpus, unit test runner | A committed navigation increments nav_epoch, writes it to P2, and emits a nav event carrying it; the event epoch equals the next snapshot epoch; events are ordered by occurrence; a nav event is never dropped under buffer pressure. |
-| 60 | Implement P3 session-partitioner and open two workspaces on the engine. | language stdlib, engine harness, unit test runner | Each workspace maps to exactly one partition; a cookie set in one workspace is absent from another workspace's surface; open refuses a ctx without a workspace-scoped key. |
-| 70 | Implement P1 render-surface-contract and wire all parts to the engine. | language stdlib, engine harness, unit test runner | The six operations dispatch to their parts; open establishes the per-session ticket key with the gate; act with no ticket performs nothing; every engine call originates inside an L0 part. |
+| 60 | Implement P3 session-partitioner and open two workspaces on the engine. | language stdlib, engine harness, unit test runner | Each workspace maps to exactly one partition; a cookie set in one workspace is absent from another workspace's surface; partition_for refuses a key not scoped to its workspace_id. |
+| 70 | Implement P1 render-surface-contract and wire all parts to the engine. | language stdlib, engine harness, unit test runner | The six operations dispatch to their parts; open establishes the per-session ticket key with the gate; open refuses a ctx without a workspace-scoped key; act with no ticket performs nothing; every engine call originates inside an L0 part. |
 | 80 | Ticket and epoch invalidation battery with fault injection and a fake clock. | fault-injection harness, fake clock, unit test runner | Navigation, target mutation, ticket reuse, ticket expiry, digest mismatch, and epoch skew each cause act to reject and perform nothing; observe emits the new epoch on every committed navigation; each act follows a matching ticket verification. |
 | 90 | Adversarial secret and ticket battery with a scripted hostile caller. | adversarial harness, stub surface with leak detectors, unit test runner | No proposal stream reads a secret byte across returns, snapshots, or events; forged and expired tickets never execute; masked fields never expose a filled value; the session key never surfaces above L0. |
 | 100 | Latency and throughput measurement over reference corpora. | benchmark harness with high-resolution clock | p99 measured at or below budget: snapshot 250 ms on a 20000-node graph, nav-event delivery 20 ms; measured under concurrent load with an instrumented engine harness. |
