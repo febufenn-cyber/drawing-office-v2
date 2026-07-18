@@ -1,11 +1,15 @@
-"""Conformance validator for drawing-office LLD.md files.
+"""Conformance validator for Drawing Standard rev C LLD.md files.
 
-Enforces the machine-checked rules in STANDARD.md. Stdlib only.
+Enforces the machine-checked rules in STANDARD.md (rev C). Stdlib only.
 
 Usage: python tools/validate.py <path> [<path>...]
 Each path is a directory (recursively globbed for LLD.md) or a file.
 Errors go to stdout as `path:line: E### message`, sorted by (path, line).
 Exit 1 if any errors, 0 if clean, 2 on usage problems.
+
+The validator checks form, never substance: a citation's presence and
+format, not its resolution; a basis label's existence, not its honesty;
+a falsifier op's existence in the plan, not its teeth.
 """
 
 import os
@@ -18,6 +22,8 @@ CANONICAL_KEYS = [
     'id', 'title', 'revision', 'status', 'author',
     'reviewed_by', 'date', 'part_count', 'supersedes',
 ]
+
+DERIVED_KEYS = ['source', 'source_rev', 'subject', 'derived_by']
 
 REQUIRED_SECTIONS = [
     '## ASSEMBLY DRAWING',
@@ -38,28 +44,20 @@ REVISION_RE = re.compile(r'[A-Z]+')
 DATE_RE = re.compile(r'[0-9]{4}-[0-9]{2}-[0-9]{2}')
 INT_RE = re.compile(r'[0-9]+')
 PART_RE = re.compile(r'P[0-9]+')
+HASH_RE = re.compile(r'[0-9a-f]{40}|[0-9a-f]{64}')
+OP_REF_RE = re.compile(r'Op\s+([0-9]+)')
+COMMODITY_RE = re.compile(r'commodity part', re.IGNORECASE)
+EXTERNAL_RE = re.compile(r'external part\s*[—–-]*\s*see\s+DO-[0-9]{3}',
+                         re.IGNORECASE)
+SOURCE_ANCHOR_RE = re.compile(r'^Source:\s+\S')
 
-# The complete rejection set for tolerance cells: empty, hyphen, em dash, en dash.
+# The complete rejection set for tolerance cells: empty, hyphen, em/en dash.
 DASH_CELLS = {'', '-', '—', '–'}
 
 STATUSES = {'draft', 'released', 'superseded'}
-
-# v2: every tolerance declares its KIND. Non-behavioral kinds require an
-# inspection op whose tooling can actually OBSERVE that class of violation --
-# a behavior test cannot see an O(n)-vs-O(1) regression, a missing fault seam,
-# or a concurrency race. This is the anti-toothless mechanism (E610).
-KIND_ENUM = {'behavioral', 'complexity', 'timing',
-             'resource', 'concurrency', 'fault'}
-KIND_TOOLING = {
-    'complexity':  ('measure', 'timing', 'benchmark', 'counter',
-                    'profil', 'latency', 'clock'),
-    'timing':      ('measure', 'timing', 'benchmark', 'latency',
-                    'clock', 'stopwatch'),
-    'resource':    ('measure', 'counter', 'profil', 'memory', 'benchmark'),
-    'concurrency': ('race', 'concurrent', 'interleav', 'thread',
-                    'goroutine', 'parallel'),
-    'fault':       ('fault', 'inject', 'failure', 'crash', 'kill'),
-}
+BASES = {'observed', 'documented', 'inferred', 'unknown'}
+CITATION_RE = re.compile(
+    r'^(code|commit|doc|issue|searched)\s+\S.*$')
 
 
 def parse_cells(line):
@@ -126,11 +124,12 @@ def parse_front_matter(lines):
     """Parse the front matter block.
 
     Returns (entries, close_line, errors). entries maps key -> (value, line)
-    for first occurrences of canonical keys. close_line is the 1-based line
-    of the closing --- or None. errors is a list of (line, code, message).
+    for first occurrences of known keys. close_line is the 1-based line of
+    the closing --- or None. errors is a list of (line, code, message).
     """
     errors = []
     entries = {}
+    known = CANONICAL_KEYS + DERIVED_KEYS
     if not lines or lines[0].strip() != '---':
         errors.append((1, 'E101', 'front matter block missing at line 1'))
         return entries, None, errors
@@ -152,7 +151,7 @@ def parse_front_matter(lines):
             errors.append((ln, 'E103',
                            'malformed front matter line (not key: value)'))
             continue
-        if key not in CANONICAL_KEYS:
+        if key not in known:
             errors.append((ln, 'E104', 'unknown key ' + key))
             continue
         if key in entries:
@@ -164,6 +163,19 @@ def parse_front_matter(lines):
     for key in CANONICAL_KEYS:
         if key not in entries:
             errors.append((close_line, 'E106', 'missing key ' + key))
+    # E116: derived keys are all-or-none.
+    present = [k for k in DERIVED_KEYS if k in entries]
+    if present and len(present) != len(DERIVED_KEYS):
+        missing = [k for k in DERIVED_KEYS if k not in entries]
+        errors.append((close_line, 'E116',
+                       'derived title-block keys are all-or-none; missing '
+                       + ', '.join(missing)))
+    # E117: source_rev is a full lowercase 40- or 64-char hash.
+    item = entries.get('source_rev')
+    if item is not None and item[0] != '' and not HASH_RE.fullmatch(item[0]):
+        errors.append((item[1], 'E117',
+                       'source_rev is not a full 40- or 64-character '
+                       'lowercase hash'))
     return entries, close_line, errors
 
 
@@ -205,22 +217,38 @@ def check_front_matter_values(entries):
     return errors
 
 
+def split_citations(cell):
+    """Split an Evidence cell on `;` into stripped citation strings."""
+    return [c.strip() for c in cell.split(';') if c.strip()]
+
+
 def validate_file(path, text):
-    """Validate one LLD file. Returns a list of (path, line, code, message)."""
+    """Validate one LLD file.
+
+    Returns (errors, own_id, refs) where errors is a list of
+    (path, line, code, message), own_id is the drawing id or None, and refs
+    is a list of (ref_id, line) from the BOM Ref column.
+    """
     lines = text.splitlines()
     raw = []
 
     entries, close_line, fm_errors = parse_front_matter(lines)
     raw.extend(fm_errors)
 
+    is_derived = all(k in entries for k in DERIVED_KEYS)
+
     part_count = None
     part_count_line = None
+    own_id = None
     if close_line is not None:
         raw.extend(check_front_matter_values(entries))
         item = entries.get('part_count')
         if item and INT_RE.fullmatch(item[0]) and int(item[0]) > 0:
             part_count = int(item[0])
             part_count_line = item[1]
+        item = entries.get('id')
+        if item and item[0] != '':
+            own_id = item[0]
 
     content_start = close_line + 1 if close_line is not None else 1
     fenced, mermaid_lines = scan_fences(lines)
@@ -271,10 +299,11 @@ def validate_file(path, text):
         if not any(head < ml <= end for ml in mermaid_lines):
             raw.append((head, 'E301', 'no mermaid fence in ASSEMBLY DRAWING'))
 
-    # --- BILL OF MATERIALS (E401-E404) ---
+    # --- BILL OF MATERIALS (E401-E407) ---
     bom_rows = []          # (part, line) per data row, in order
     bom_part_set = set()
     bom_present = False
+    refs = []              # (ref_id, line) for DO-NNN refs
     span = section_span('## BILL OF MATERIALS')
     if span is not None:
         head, end = span
@@ -284,6 +313,14 @@ def validate_file(path, text):
         else:
             bom_present = True
             table = tables[0]
+            header_cells = parse_cells(lines[table['header'] - 1])
+            ref_idx = None
+            for ci, cell in enumerate(header_cells):
+                if cell.lower() == 'ref':
+                    ref_idx = ci
+            if ref_idx is None:
+                raw.append((table['header'], 'E406',
+                            'BOM table has no Ref column'))
             seen_parts = set()
             for row_ln in table['data']:
                 cells = parse_cells(lines[row_ln - 1])
@@ -298,12 +335,25 @@ def validate_file(path, text):
                     raw.append((row_ln, 'E403',
                                 'duplicate BOM part number ' + part))
                 seen_parts.add(part)
+                if ref_idx is not None:
+                    ref = cells[ref_idx] if ref_idx < len(cells) else ''
+                    if ref == 'local':
+                        pass
+                    elif ID_RE.fullmatch(ref):
+                        refs.append((ref, row_ln))
+                        if own_id is not None and ref == own_id:
+                            raw.append((row_ln, 'E407',
+                                        'ref cites the drawing\'s own id'))
+                    else:
+                        raw.append((row_ln, 'E405',
+                                    'ref cell neither local nor DO-NNN: '
+                                    + repr(ref)))
             if part_count is not None and part_count != len(table['data']):
                 raw.append((part_count_line, 'E404',
                             'part_count %d does not equal BOM data-row '
                             'count %d' % (part_count, len(table['data']))))
 
-    # --- DETAIL DRAWINGS (E501-E503) ---
+    # --- DETAIL DRAWINGS (E501-E504) ---
     span = section_span('## DETAIL DRAWINGS')
     if span is not None:
         head, end = span
@@ -325,20 +375,33 @@ def validate_file(path, text):
                             'BOM: ' + part))
             body_end = h3s[idx + 1][0] - 1 if idx + 1 < len(h3s) else end
             has_mermaid = any(ln < ml <= body_end for ml in mermaid_lines)
-            has_commodity = any('commodity part' in lines[j].lower()
-                                for j in range(ln, body_end))
-            if not has_mermaid and not has_commodity:
+            has_commodity = any(COMMODITY_RE.search(lines[j])
+                                for j in range(ln, body_end)
+                                if not fenced[j])
+            has_external = any(EXTERNAL_RE.search(lines[j])
+                               for j in range(ln, body_end)
+                               if not fenced[j])
+            if not has_mermaid and not has_commodity and not has_external:
                 raw.append((ln, 'E502',
-                            'detail entry has neither a mermaid fence nor '
-                            'a commodity note'))
+                            'detail entry has neither a diagram nor a '
+                            'commodity or external-part note'))
+            if is_derived:
+                has_anchor = any(SOURCE_ANCHOR_RE.match(lines[j])
+                                 for j in range(ln, body_end)
+                                 if not fenced[j])
+                if not has_anchor and not has_commodity and not has_external:
+                    raw.append((ln, 'E504',
+                                'derived detail entry has no Source: anchor '
+                                'and is not a commodity or external-part '
+                                'note'))
         if bom_present:
             for part, row_ln in bom_rows:
                 if part not in detail_parts:
                     raw.append((row_ln, 'E501',
                                 'BOM part has no detail heading: ' + part))
 
-    # --- PROCESS PLAN op -> tooling map (for E606 / E610 cross-checks) ---
-    process_tooling = {}   # op-number str -> lowercased tooling cell
+    # --- PROCESS PLAN op set (for E606 cross-checks) ---
+    process_ops = set()
     span_pp = section_span('## PROCESS PLAN')
     if span_pp is not None:
         head_pp, end_pp = span_pp
@@ -347,11 +410,9 @@ def validate_file(path, text):
             for row_ln in pp_tables[0]['data']:
                 cells = parse_cells(lines[row_ln - 1])
                 if cells and INT_RE.fullmatch(cells[0]):
-                    tooling = cells[2].lower() if len(cells) > 2 else ''
-                    process_tooling[cells[0]] = tooling
+                    process_ops.add(cells[0])
 
-    # --- CONTRACTS & TOLERANCES (v2: E601-E610) ---
-    op_ref_re = re.compile(r'Op\s+([0-9]+)')
+    # --- CONTRACTS & TOLERANCES (E601-E611) ---
     span = section_span('## CONTRACTS & TOLERANCES')
     if span is not None:
         head, end = span
@@ -364,22 +425,20 @@ def validate_file(path, text):
             for ci, cell in enumerate(header_cells):
                 idx[cell.lower()] = ci
             tol_idx = idx.get('tolerance')
-            ret_idx = idx.get('return shape')
-            kind_idx = idx.get('kind')
             op_idx = idx.get('inspection op')
+            basis_idx = idx.get('basis')
+            ev_idx = idx.get('evidence')
             if tol_idx is None:
                 raw.append((table['header'], 'E602',
                             'contract table has no Tolerance column'))
                 continue
-            if ret_idx is None:
-                raw.append((table['header'], 'E607',
-                            'contract table has no "Return shape" column'))
-            if kind_idx is None:
-                raw.append((table['header'], 'E608',
-                            'contract table has no "Kind" column'))
             if op_idx is None:
                 raw.append((table['header'], 'E604',
-                            'contract table has no "Inspection op" column'))
+                            'contract table has no Inspection-op column'))
+            if is_derived and (basis_idx is None or ev_idx is None):
+                raw.append((table['header'], 'E607',
+                            'derived contract table lacks Basis and '
+                            'Evidence columns'))
 
             def cell_at(cells, i):
                 return cells[i] if (i is not None and i < len(cells)) else ''
@@ -387,68 +446,72 @@ def validate_file(path, text):
             for row_ln in table['data']:
                 cells = parse_cells(lines[row_ln - 1])
 
-                # E603: tolerance present
-                if cell_at(cells, tol_idx) in DASH_CELLS:
+                # E603: tolerance present.
+                tol = cell_at(cells, tol_idx)
+                if tol in DASH_CELLS:
                     raw.append((row_ln, 'E603',
                                 'tolerance cell empty or dash-only'))
-                # E607: return shape present (closes the return-shape gap)
-                if ret_idx is not None and cell_at(cells, ret_idx) in DASH_CELLS:
-                    raw.append((row_ln, 'E607',
-                                'return-shape cell empty or dash-only'))
-                # E608: kind present and valid
-                kind = cell_at(cells, kind_idx).lower()
-                if kind_idx is not None:
-                    if kind in DASH_CELLS:
-                        raw.append((row_ln, 'E608',
-                                    'kind cell empty or dash-only'))
-                    elif kind not in KIND_ENUM:
-                        raw.append((row_ln, 'E608',
-                                    'kind not one of '
-                                    + '|'.join(sorted(KIND_ENUM))
-                                    + ': ' + repr(kind)))
-                # E605 / E606: inspection-op coverage
-                refs = []
+                # E605 / E606: inspection-op coverage.
                 if op_idx is not None:
                     op_cell = cell_at(cells, op_idx)
-                    if op_cell in DASH_CELLS:
+                    refs_found = OP_REF_RE.findall(op_cell)
+                    if op_cell in DASH_CELLS or not refs_found:
                         raw.append((row_ln, 'E605',
-                                    'tolerance has no inspection op '
-                                    '(coverage gap)'))
-                    else:
-                        refs = op_ref_re.findall(op_cell)
-                        if not refs:
-                            raw.append((row_ln, 'E605',
-                                        'inspection-op cell has no Op NN '
-                                        'reference: ' + repr(op_cell)))
-                        for num in refs:
-                            if num not in process_tooling:
-                                raw.append((row_ln, 'E606',
-                                            'inspection op Op %s not in '
-                                            'Process Plan' % num))
-                # E610: anti-toothless. A non-behavioral tolerance must cite an
-                # op whose tooling can OBSERVE that class of violation.
-                if kind in KIND_TOOLING and refs:
-                    needed = KIND_TOOLING[kind]
-                    ok = any(any(kw in process_tooling.get(num, '')
-                                 for kw in needed)
-                             for num in refs)
-                    if not ok:
-                        raw.append((row_ln, 'E610',
-                                    'kind=%s but no cited op uses %s tooling '
-                                    '(toothless: a behavior test cannot '
-                                    'observe this violation)'
-                                    % (kind, '/'.join(needed))))
+                                    'tolerance cites no Op NN inspection '
+                                    'op (coverage gap)'))
+                    for num in refs_found:
+                        if num not in process_ops:
+                            raw.append((row_ln, 'E606',
+                                        'inspection op Op %s not in '
+                                        'Process Plan' % num))
+                # E608-E611: derived-drawing evidence discipline.
+                if is_derived and basis_idx is not None and ev_idx is not None:
+                    basis = cell_at(cells, basis_idx)
+                    ev_cell = cell_at(cells, ev_idx)
+                    if basis not in BASES:
+                        raw.append((row_ln, 'E608',
+                                    'basis not one of '
+                                    'observed|documented|inferred|unknown: '
+                                    + repr(basis)))
+                    citations = split_citations(ev_cell)
+                    kinds = []
+                    for cit in citations:
+                        m = CITATION_RE.match(cit)
+                        if not m:
+                            raw.append((row_ln, 'E609',
+                                        'evidence citation does not match '
+                                        'grammar: ' + repr(cit)))
+                        else:
+                            kinds.append(m.group(1))
+                    if not citations:
+                        raw.append((row_ln, 'E609',
+                                    'evidence cell has no citation'))
+                    if basis in BASES:
+                        if 'searched' in kinds and basis != 'unknown':
+                            raw.append((row_ln, 'E610',
+                                        'searched citation permitted only '
+                                        'under basis unknown'))
+                        if basis == 'observed' and 'code' not in kinds:
+                            raw.append((row_ln, 'E610',
+                                        'basis observed requires a code '
+                                        'citation'))
+                        if basis == 'documented' and not (
+                                {'doc', 'commit', 'issue'} & set(kinds)):
+                            raw.append((row_ln, 'E610',
+                                        'basis documented requires a doc, '
+                                        'commit, or issue citation'))
+                        if basis == 'inferred' and not [
+                                k for k in kinds if k != 'searched']:
+                            raw.append((row_ln, 'E610',
+                                        'basis inferred requires a '
+                                        'non-searched citation'))
+                        if (tol == 'undetermined') != (basis == 'unknown'):
+                            raw.append((row_ln, 'E611',
+                                        'tolerance undetermined if and only '
+                                        'if basis unknown'))
 
-    return [(path, ln, code, msg) for ln, code, msg in raw]
-
-
-def extract_id(text):
-    """Return (id_value, line) from the front matter, or None."""
-    entries, _, _ = parse_front_matter(text.splitlines())
-    item = entries.get('id')
-    if item is not None and item[0] != '':
-        return item
-    return None
+    errors = [(path, ln, code, msg) for ln, code, msg in raw]
+    return errors, own_id, refs
 
 
 def collect_files(args):
@@ -473,6 +536,60 @@ def collect_files(args):
     return unique, None
 
 
+def check_register(per_file):
+    """Register-wide checks E109, E408, E409 across the validated set.
+
+    per_file: list of (path, own_id, id_line, refs). Returns error tuples.
+    """
+    errors = []
+    seen_ids = {}
+    for path, own_id, id_line, refs in per_file:
+        if own_id is None:
+            continue
+        if own_id in seen_ids:
+            errors.append((path, id_line, 'E109',
+                           'duplicate id %s across the validated set '
+                           '(first in %s)' % (own_id, seen_ids[own_id])))
+        else:
+            seen_ids[own_id] = path
+    # E408: every ref resolves to a drawing in the validated set.
+    graph = {}
+    for path, own_id, id_line, refs in per_file:
+        if own_id is not None:
+            graph.setdefault(own_id, set())
+        for ref, line in refs:
+            if ref not in seen_ids:
+                errors.append((path, line, 'E408',
+                               'ref %s does not resolve to a drawing in '
+                               'the validated set' % ref))
+            elif own_id is not None:
+                graph[own_id].add(ref)
+    # E409: ref edges contain no cycle.
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {node: WHITE for node in graph}
+    cyclic = set()
+
+    def visit(node, stack):
+        color[node] = GRAY
+        for nxt in sorted(graph.get(node, ())):
+            if nxt not in color:
+                continue
+            if color[nxt] == GRAY:
+                cyclic.update(stack + [nxt])
+            elif color[nxt] == WHITE:
+                visit(nxt, stack + [nxt])
+        color[node] = BLACK
+
+    for node in sorted(graph):
+        if color[node] == WHITE:
+            visit(node, [node])
+    for path, own_id, id_line, refs in per_file:
+        if own_id in cyclic:
+            errors.append((path, id_line, 'E409',
+                           'ref edges form a cycle through %s' % own_id))
+    return errors
+
+
 def main(argv):
     if len(argv) < 2:
         print(USAGE, file=sys.stderr)
@@ -482,7 +599,7 @@ def main(argv):
         print('error: no such file or directory: ' + bad_arg, file=sys.stderr)
         return 2
     errors = []
-    seen_ids = {}
+    per_file = []
     for path in files:
         try:
             with open(path, encoding='utf-8-sig') as fh:
@@ -490,16 +607,13 @@ def main(argv):
         except OSError as exc:
             print('error: cannot read %s: %s' % (path, exc), file=sys.stderr)
             return 2
-        errors.extend(validate_file(path, text))
-        found = extract_id(text)
-        if found is not None:
-            value, line = found
-            if value in seen_ids:
-                errors.append((path, line, 'E109',
-                               'duplicate id %s across the validated set '
-                               '(first in %s)' % (value, seen_ids[value])))
-            else:
-                seen_ids[value] = path
+        file_errors, own_id, refs = validate_file(path, text)
+        errors.extend(file_errors)
+        entries, _, _ = parse_front_matter(text.splitlines())
+        item = entries.get('id')
+        id_line = item[1] if item is not None else 1
+        per_file.append((path, own_id, id_line, refs))
+    errors.extend(check_register(per_file))
     errors.sort(key=lambda e: (e[0], e[1], e[2]))
     for path, line, code, message in errors:
         print('%s:%d: %s %s' % (path, line, code, message))
