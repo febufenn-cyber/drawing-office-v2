@@ -69,7 +69,7 @@ classDiagram
         +parameters: list of Parameter
         +steps: list of SkillStep
         +guards: list of Guard
-        +postconditions: list of Expr
+        +postconditions: list of string
         +provenance: Provenance
         +status: SkillStatus
     }
@@ -96,19 +96,24 @@ classDiagram
     class Provenance {
         +trajectory_ref: string
         +generalizing_model: string
-        +compiled_at: iso8601
         +source_digest: hex64
+    }
+    class Guard {
+        +subject: string
+        +relation: string
+        +value: string
     }
     Skill --> Parameter
     Skill --> SkillStep
+    Skill --> Guard
     Skill --> Provenance
     SkillStep --> NodeLocator
     SkillStep --> Binding
 ```
 
-Enums, closed: `SkillStatus` = candidate, verified, promoted, demoted, relearning. `ActionKind` = click, type, select, submit, navigate, extract — the RenderSurface action kinds, with extract standing for a read-only snapshot read.
+Enums, closed: `SkillStatus` = candidate, promoted, demoted, relearning. `ActionKind` = click, type, select, submit, navigate, extract — the RenderSurface action kinds, with extract standing for a read-only snapshot read.
 
-A skill is a script, not a recording. Each `SkillStep` names a `NodeLocator` — role, accessible-name pattern, and structural path — never a raw CSS selector and never a snapshot-specific node id, so the step survives minor DOM drift by resolving to a fresh stable node id against the replay snapshot. A `Binding` sets one action field either from a named `Parameter` or from a literal captured at compile time. `provenance.source_digest` is the digest of the source trajectory, and `generalizing_model` names the model that produced the lift so the verifier can refuse to grade its own work.
+A skill is a script, not a recording. Each `SkillStep` names a `NodeLocator` — role, accessible-name pattern, and structural path — never a raw CSS selector and never a snapshot-specific node id, so the step survives minor DOM drift by resolving to a fresh stable node id against the replay snapshot. A `Binding` sets one action field either from a named `Parameter` or from a literal captured at compile time. `provenance.source_digest` is the digest of the source trajectory, and `generalizing_model` names the model that produced the lift so the verifier can refuse to grade its own work. A `Guard` — subject, relation, value — is a precondition asserted against the replay snapshot before the first action, and a postcondition is a natural-language assertion the verifier's grader model evaluates against the run outputs.
 
 Canonical serialization is deterministic JSON — sorted keys, no whitespace, UTF-8. `skill_digest(skill)` is the SHA-256 hex of the canonical form over the signature, parameters, steps, and guards, excluding the mutable status; it is the version identity. Validation rejects an untyped parameter, a binding to an undeclared parameter, an unbound locator, an unknown action kind, and absent provenance.
 
@@ -235,9 +240,8 @@ stateDiagram-v2
     [*] --> Candidate: trajectory generalized
     Candidate --> Rejected: generalization post-check fails
     Candidate --> Verifying: independent verification
-    Verifying --> Verified: replay reproduces expected outputs
-    Verifying --> Rejected: replay diverges or locator unbound
-    Verified --> Promoted: written to the library, lookup eligible
+    Verifying --> Promoted: replay reproduces expected outputs, written to the library
+    Verifying --> Candidate: replay diverges or locator unbound
     Promoted --> Demoted: demotion signal from replay-monitor
     Demoted --> Relearning: re-learning request recorded
     Relearning --> Candidate: re-compiled from a fresh trajectory
@@ -264,14 +268,14 @@ demote(signal):
  2. IF rec is none: RETURN noop
  3. P4.put(rec.skill, status: demoted, durable: true)
  4. record re-learning request for signal.signature
- 5. RETURN demoted(rec.skill_id)
+ 5. RETURN demoted(rec.skill.skill_id)
 ```
 
 ### P6 — replay-monitor
 
 ```mermaid
 flowchart TB
-    IN["production replay outcome: skill_id, ok"] --> UPD["increment success or failure counter durably"]
+    IN["production replay outcome: signature, ok"] --> UPD["increment success or failure counter durably"]
     UPD --> WIN["evaluate failures over the bounded recent window"]
     WIN --> TEST["failures at or above the criterion and not already signaled"]
     TEST --> SIG["raise one demotion signal"]
@@ -281,12 +285,12 @@ flowchart TB
 The monitor consumes the outcome of every production replay the executor reports for a served skill and increments the per-skill success or failure counter durably before acknowledging, so no outcome is lost behind the reliability figure it feeds. The demotion criterion is a fixed threshold over a bounded recent window, not lifetime totals, so a long-successful skill that breaks on a site change demotes promptly. A crossing raises exactly one demotion signal; subsequent failures on the same already-signaled skill raise none, so a broken skill cannot storm the controller. Counters persist per workspace through the workspace store.
 
 ```text
-record_outcome(skill_id, ok):
- 1. IF ok: increment success_count(skill_id) durable
- 2. ELSE: increment failure_count(skill_id) durable
- 3. recent := failures for skill_id within the recent window
- 4. IF recent at or above criterion AND skill_id not already signaled:
- 5.   mark skill_id signaled; RETURN demotion_signal(skill_id)
+record_outcome(signature, ok):
+ 1. IF ok: increment success_count(signature) durable
+ 2. ELSE: increment failure_count(signature) durable
+ 3. recent := failures for signature within the recent window
+ 4. IF recent at or above criterion AND signature not already signaled:
+ 5.   mark signature signaled; RETURN demotion_signal(signature)
  6. RETURN no_signal
 ```
 
@@ -338,7 +342,7 @@ P6 — replay-monitor:
 
 | Operation | Input domain | Nominal behavior | Tolerance | Inspection op | Failure mode outside tolerance |
 |-----------|--------------|------------------|-----------|---------------|--------------------------------|
-| record_outcome(skill_id, ok) | a production replay outcome for a served skill | Increments the per-skill success or failure counter durably. | Counters exact to the reported outcome count; durable before acknowledged; exact | Op 50 | A lost or double-counted outcome miswrites reliability; inspection rejects a non-durable increment. |
+| record_outcome(signature, ok) | a production replay outcome for a served skill | Increments the per-skill success or failure counter durably. | Counters exact to the reported outcome count; durable before acknowledged; exact | Op 50 | A lost or double-counted outcome miswrites reliability; inspection rejects a non-durable increment. |
 | demotion criterion | a skill's recent outcome window | Raises a demotion signal when recent failures cross the fixed threshold. | Exactly one signal per crossing over a bounded recent window, not one per subsequent failure; exact | Op 50, Op 70 | A repeated or missed signal is rejected at inspection. |
 
 Consumed boundaries (external subsystems; only the interface this subsystem calls is toleranced, never their internals):

@@ -40,6 +40,7 @@ flowchart TB
     P2 -->|Trajectory| P3
     P3 -->|learning pass| MR
     P3 -->|versioned SiteAdapter| P4
+    P5 -->|load current version| P4
     P5 -->|scheduled replay via| P1
     P5 -->|HealthReport| P6
     P6 -->|drift verdict| P7
@@ -47,7 +48,7 @@ flowchart TB
     P7 -->|verify then swap pointer| P4
 ```
 
-The agent runtime asks the exploration-recorder to explore a new origin; the recorder drives one pass through RenderSurface, observes each PageGraph snapshot, and emits a Trajectory. The adapter-synthesizer runs a single learning pass over that trajectory through the model router and writes a versioned SiteAdapter, plus its source trajectory, into the adapter-store. Thereafter the agent runtime calls the adapter's typed tools through the site-adapter-contract, which loads the current version from the store and replays each tool's parameterized steps against RenderSurface and PageGraph with no further model call. The health-checker replays every tool on a schedule; the drift-detector classifies the report against the compiled baseline; and on drift the hot-swapper re-explores, re-synthesizes, verifies, and atomically swaps the store's current-version pointer.
+The agent runtime asks the exploration-recorder to explore a new origin; the recorder drives one pass through RenderSurface, observes each PageGraph snapshot, and emits a Trajectory. The adapter-synthesizer runs a single learning pass over that trajectory through the model router and writes a versioned SiteAdapter, plus its source trajectory, into the adapter-store, and that first version is then promoted live by an atomic swap of the store's current-version pointer. Thereafter the agent runtime calls the adapter's typed tools through the site-adapter-contract, which loads the current version from the store and replays each tool's parameterized steps against RenderSurface and PageGraph with no further model call. The health-checker replays every tool on a schedule; the drift-detector classifies the report against the compiled baseline; and on drift the hot-swapper re-explores, re-synthesizes, verifies, and atomically swaps the store's current-version pointer.
 
 ## BILL OF MATERIALS
 
@@ -84,6 +85,7 @@ classDiagram
         +params_schema: Schema
         +return_schema: Schema
         +steps: list of Step
+        +golden_params: ParamSet
         +assertions: list of Assertion
         +provenance: list of ProvenanceRef
     }
@@ -147,7 +149,7 @@ replay(adapter, tool, params):
  4. RETURN ToolResult(record, actions, tool.provenance)
 ```
 
-Replay is deterministic: identical params against an identical PageGraph state yield a byte-identical action sequence and record. Anchors resolve by structural digest and role, so an adapter survives minor DOM drift; an anchor that no longer resolves is a replay failure, never a raw-selector fallback. `replay_digest` is the digest of the ordered steps and schemas and is the adapter version's identity for health and drift comparison.
+Replay is deterministic: identical params against an identical PageGraph state yield a byte-identical action sequence and record. Anchors resolve by structural digest and role, so an adapter survives minor DOM drift; an anchor that no longer resolves is a replay failure, never a raw-selector fallback. `replay_digest` is the digest of the ordered steps and schemas and is the adapter version's identity for rollback and provenance, not a health or drift signal.
 
 ### P2 — exploration-recorder
 
@@ -208,7 +210,7 @@ Rules, each a decision on this sheet:
 - A literal typed or selected during exploration becomes a typed param when the model marks it variable, and a fixed literal binding otherwise. Every param traces to exactly one trajectory literal; the return schema covers every field the trajectory's read steps captured.
 - Every synthesized step carries a ProvenanceRef to the trajectory step it generalizes, and the adapter carries the whole trajectory's id. Provenance is total: no tool and no step exists without a trajectory anchor.
 - Synthesis is deterministic given the trajectory and the model response: the same pair yields a byte-identical SiteAdapter and replay_digest. The nondeterministic model call is isolated to this step; the emitted adapter replays with no model.
-- The synthesizer also records golden assertions from the trajectory outcome for each tool: for a search tool, at least one record with the required fields present; for an extract tool, the full return schema populated. These assertions are the health baseline.
+- The synthesizer also records, for each tool, its golden params and its golden assertions from the trajectory. The golden params are the concrete parameter values the trajectory supplied to that tool, stored as `Tool.golden_params` for the health-checker to replay. The golden assertions are, for a search tool, at least one record with the required fields present, and for an extract tool, the full return schema populated. These golden params and assertions are the health baseline.
 
 ### P4 — adapter-store
 
@@ -217,11 +219,11 @@ Versioned, per-origin, append-only. The store holds each compiled SiteAdapter an
 ```mermaid
 stateDiagram-v2
     [*] --> Empty: origin never explored
-    Empty --> V1: put(adapter v1, trajectory)
-    V1 --> V1: current pointer serves v1
-    V1 --> V2: put(adapter v2, trajectory) and pointer holds v1
+    Empty --> V1: put(adapter v1, trajectory), pointer still empty
+    V1 --> Live1: swap pointer to v1 atomically
+    Live1 --> V2: put(adapter v2, trajectory) and pointer holds v1
     V2 --> Live2: swap pointer to v2 atomically
-    Live2 --> V1: rollback pointer to retained v1
+    Live2 --> Live1: rollback pointer to retained v1
     Live2 --> [*]
 ```
 
@@ -275,11 +277,11 @@ The health run replays only; it calls no model and mutates no adapter. Health pr
 
 ### P6 — drift-detector
 
-Classification and debounce. The detector compares a HealthReport against the adapter's compiled baseline — the replay_digest and the golden assertions — and assigns each tool healthy, drifted, or broken. The adapter status is the worst tool status. To avoid thrashing on a transient network failure, drift is declared only after three consecutive failing health runs for the same tool; a single failing run is recorded and awaited.
+Classification and debounce. The detector compares a HealthReport against the adapter's compiled baseline — the return schemas and the golden assertions — and assigns each tool healthy, drifted, or broken from anchor resolution, return-schema validation, and the golden assertions. The adapter status is the worst tool status. To avoid thrashing on a transient network failure, drift is declared only after three consecutive failing health runs for the same tool; a single failing run is recorded and awaited.
 
 ```mermaid
 flowchart TB
-    HR["HealthReport"] --> CMP["compare each tool to baseline: digest, schema, assertions"]
+    HR["HealthReport"] --> CMP["compare each tool to baseline: anchors, schema, assertions"]
     CMP --> CLS{"tool status"}
     CLS -->|healthy| OK["record healthy; reset failure count"]
     CLS -->|drifted or broken| CNT{"third consecutive failure"}
@@ -366,7 +368,7 @@ P6 — drift-detector:
 
 | Operation | Input domain | Nominal behavior | Tolerance | Inspection op | Failure mode outside tolerance |
 |-----------|--------------|------------------|-----------|---------------|--------------------------------|
-| classify(report, baseline) | a HealthReport and the compiled baseline | Classifies each tool healthy, drifted, or broken and sets the adapter status to the worst tool status. | Adapter status equals the worst tool status; classification exact per the baseline digest, schema, and assertions | Op 60 | A misclassified tool or an adapter status below its worst tool fails inspection. |
+| classify(report, baseline) | a HealthReport and the compiled baseline | Classifies each tool healthy, drifted, or broken and sets the adapter status to the worst tool status. | Adapter status equals the worst tool status; classification exact per baseline anchor resolution, return schema, and golden assertions | Op 60 | A misclassified tool or an adapter status below its worst tool fails inspection. |
 | debounce | consecutive HealthReports for an origin | Declares drift and signals re-learn only after three consecutive failing runs for a tool. | Drift declared only on the third consecutive failing run; a single failing run never signals re-learn; exact | Op 60, Op 90 | A re-learn triggered by one transient failure fails the debounce inspection. |
 
 P7 — hot-swapper:

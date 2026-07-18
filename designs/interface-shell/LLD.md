@@ -39,6 +39,7 @@ flowchart TB
     P4 -->|ApprovalResponse| ACP
     USER -->|approve or deny| P4
     USER -->|toggle, browse| P6
+    P6 -.->|host inline| P1
     P6 -.->|host inline| P2
     P6 -.->|host inline| P4
 ```
@@ -71,7 +72,7 @@ flowchart TB
     SUB --> H["return task handle; bind a task card"]
 ```
 
-The intent-box is the sole entry for new work. Classification is deterministic: a string that parses as an absolute URL with scheme and host becomes a navigate task against that origin, and every other non-empty string becomes a natural-language task-intent. The box never executes the intent itself; it submits to DO-016 and returns the task handle the card model subscribes to. An empty-after-trim string is rejected in place and creates no task, so a URL and a plain request follow the same one-intent-one-task path.
+The intent-box is the sole entry for new work. Classification is deterministic: a string that parses as an absolute URL with scheme and host becomes a navigate task against that origin, and every other non-empty string becomes a natural-language task-intent. The box never executes the intent itself; it submits to DO-016 and returns the task handle the card model subscribes to. The box takes its workspace from the ambient-sidebar that hosts it: workspace_id is that sidebar's foreground workspace, so every submitted task lands in the workspace the user is browsing. An empty-after-trim string is rejected in place and creates no task, so a URL and a plain request follow the same one-intent-one-task path.
 
 ```text
 submit_intent(text):
@@ -82,8 +83,9 @@ submit_intent(text):
       task := navigate_task(origin_of(s), s)
     ELSE:
       task := intent_task(s)
- 4. handle := executor.submit(task, workspace_id)
- 5. RETURN handle
+ 4. workspace_id := host_sidebar.foreground_workspace
+ 5. handle := executor.submit(task, workspace_id)
+ 6. RETURN handle
 ```
 
 ### P2 — task-card-model
@@ -99,7 +101,6 @@ classDiagram
         +activity_ref: string
         +artifact_refs: list of string
         +evidence_refs: list of string
-        +pending_request_id: uuid or none
         +updated_seq: int
     }
     class PlanStep {
@@ -110,7 +111,7 @@ classDiagram
     TaskCard --> PlanStep
 ```
 
-Enums, closed: `CardStatus` = submitted, planning, running, awaiting_approval, done, failed. The card model is the single subscriber to a task's DO-016 run state and holds no run state of its own beyond the projection. Each run-state update advances the card by a pure mapping: run.started to planning, the first ready step to running, a pending approval reported in run state to awaiting_approval, run.completed to done, and a terminal failure to failed. `plan` mirrors the DAG steps and their StepStatus, while `activity_ref`, `artifact_refs`, and `evidence_refs` name where P3 and P5 read. `updated_seq` carries the run-log seq the card reflects, so a card is a pure function of run state and identical state yields an identical card. The model issues no executing call; it displays a run, never advances one.
+Enums, closed: `CardStatus` = submitted, planning, running, done, failed. The card model is the single subscriber to a task's DO-016 run state and holds no run state of its own beyond the projection. Each run-state update advances the card by a pure mapping: run.started to planning, the first ready step to running, run.completed to done, and a terminal failure to failed. `plan` mirrors the DAG steps and their StepStatus, while `activity_ref`, `artifact_refs`, and `evidence_refs` name where P3 and P5 read. `updated_seq` carries the run-log seq the card reflects, so a card is a pure function of run state and identical state yields an identical card. The model issues no executing call; it displays a run, never advances one.
 
 ```text
 project(card, event):
@@ -119,10 +120,8 @@ project(card, event):
  3. IF event names a plan or step change: update card.plan
  4. IF event carries an artifact ref: append to card.artifact_refs
  5. IF event carries an evidence ref: append to card.evidence_refs
- 6. IF event reports a pending approval: card.pending_request_id := its request_id
- 7. IF event clears the approval: card.pending_request_id := none
- 8. card.updated_seq := event.seq
- 9. RETURN card
+ 6. card.updated_seq := event.seq
+ 7. RETURN card
 ```
 
 ### P3 — activity-stream
@@ -143,7 +142,24 @@ classDiagram
     ActivityStream --> ActivityItem
 ```
 
-The activity-stream turns DO-016 run-log events into a human-readable feed: one ActivityItem per surfaced event, in strict run-log seq order. It is read-only. An item may link to an artifact or evidence ref through its `ref` field, but the stream carries no control path; nothing in the feed submits work or approves an action. Events outside the surfaced set project to none and never appear. Because each item is keyed on the run-log seq, replaying a run's log reconstructs a byte-identical feed.
+Enums, closed: `ActivityKind` = lifecycle, step, action, evidence, alert. The activity-stream turns DO-016 run-log events into a human-readable feed: one ActivityItem per surfaced event, in strict run-log seq order. It is read-only. An item may link to an artifact or evidence ref through its `ref` field, but the stream carries no control path; nothing in the feed submits work or approves an action. Events outside the surfaced set project to none and never appear. Because each item is keyed on the run-log seq, replaying a run's log reconstructs a byte-identical feed.
+
+`SURFACED` is a fixed subset of DO-016's fourteen-event run-log taxonomy; `kind_of`, `render_text`, and `ref_of` are the per-event mapping the projection applies. The twelve surfaced events, each with its ActivityKind, rendered text, and ref:
+
+- run.started to kind lifecycle, text "Run started", ref none.
+- step.ready to kind step, text the step label with "ready", ref none.
+- action.submitted to kind action, text "Action proposed", ref its proposal_ref.
+- perception.read to kind evidence, text "Read a page", ref its evidence ref.
+- step.succeeded to kind step, text the step label with "done", ref none.
+- step.failed to kind alert, text the step label with "failed", ref none.
+- step.skipped to kind step, text the step label with "skipped", ref none.
+- step.in_doubt to kind alert, text the step label with "in doubt", ref none.
+- run.paused to kind lifecycle, text "Run paused", ref none.
+- run.resumed to kind lifecycle, text "Run resumed", ref none.
+- run.completed to kind lifecycle, text "Run completed", ref none.
+- replay.started to kind lifecycle, text "Replay started", ref none.
+
+The two remaining taxonomy events, step.strategy_chosen and step.pre_dispatch, are outside SURFACED and project to none.
 
 ```text
 project(event):
@@ -173,7 +189,7 @@ sequenceDiagram
     end
 ```
 
-The approval-sheet is the visual side of DO-012's approval contract and derives nothing itself. It displays the ApprovalRequest fields — origin, effective consequence, amount and currency when monetary, finding codes, and expiry — and labels every string that originated in the page as page content, so a page cannot impersonate the shell to the approver. The response it returns is bound to exactly the rendered request_id and is accepted by DO-012 only before expires_at; there is no blanket approval and no approval that outlives its request. The operator_ref and optional note ride the response to DO-012's audit trail.
+The approval-sheet is the visual side of DO-012's approval contract and derives nothing itself. It displays the ApprovalRequest fields — origin, effective consequence, amount and currency when monetary, finding codes, and expiry — and labels every string that originated in the page as page content, so a page cannot impersonate the shell to the approver. The response it returns is bound to exactly the rendered request_id and is accepted by DO-012 only before expires_at; there is no blanket approval and no approval that outlives its request. The decision carries the authenticated session operator identity as decision.operator_ref, and that operator_ref and the optional note ride the response to DO-012's audit trail.
 
 ```text
 respond(request, decision, now):
@@ -182,7 +198,7 @@ respond(request, decision, now):
  2. IF decision.request_id differs from request.request_id:
       RETURN reject(REQUEST_MISMATCH)
  3. RETURN ApprovalResponse(request.request_id, decision.approved,
-       operator_ref, decision.note)
+       decision.operator_ref, decision.note)
 ```
 
 ### P5 — evidence-panel
@@ -255,7 +271,7 @@ P2 — task-card-model:
 | Operation | Input domain | Nominal behavior | Tolerance | Inspection op | Failure mode outside tolerance |
 |-----------|--------------|------------------|-----------|---------------|--------------------------------|
 | project(card, event) | DO-016 run-state events for a task | Advances card status, plan, and refs by the fixed run-state mapping. | Card is a pure function of run state; identical event stream yields an identical card; exact | Op 20 | A card diverging from run state misleads the user; inspection replays a recorded run and compares. |
-| status mapping | any run-state event | Maps run.started to planning, first ready step to running, a reported pending approval to awaiting_approval, completion to done, terminal failure to failed. | Mapping exact and total; every event yields a defined status | Op 20 | An undefined or wrong status is rejected at inspection. |
+| status mapping | any run-state event | Maps run.started to planning, first ready step to running, completion to done, terminal failure to failed. | Mapping exact and total; every event yields a defined status | Op 20 | An undefined or wrong status is rejected at inspection. |
 | project latency | run-state events under load | Reflects a received event in the card within the latency budget. | p99 at or below 50 ms from event receipt to updated card on the Op 90 corpus | Op 90 | Over-budget projection lags the run; the op rejects the build. |
 
 P3 — activity-stream:

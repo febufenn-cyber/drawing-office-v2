@@ -50,14 +50,14 @@ flowchart TB
     RS -->|partition id| P3
 ```
 
-Orchestration and the interface create, open, archive, and delete workspaces through the workspace-store, the single lifecycle entry point; the store validates each record against the workspace-schema, asks the key-provisioner for the workspace's data key and partition id, and opens the four encrypted partition stores under that key. The agent runtime reads and writes the episodic, entity, and skill stores directly and queries the vector-index, which reads embeddings held in the episodic and entity stores. The action control plane reads a workspace's credential scope, reads its budget caps, and records spend against the budget-ledger, and takes the same per-workspace data key the RenderSurface uses to name its session partition, so the isolation boundary is one key and one partition id shared by all three subsystems.
+Orchestration and the interface create, open, archive, and delete workspaces through the workspace-store, the single lifecycle entry point; the store validates each record against the workspace-schema, asks the key-provisioner for the workspace's data key and partition id, and opens the four encrypted partition stores under that key. The agent runtime reads and writes the episodic, entity, and skill stores directly and queries the vector-index, which reads embeddings held in the episodic and entity stores. The action control plane reads a workspace's credential scope, reads its budget caps, and records spend against the budget-ledger, and takes the same per-workspace data key the store and vault use to encrypt at rest, while the RenderSurface uses the shared partition id to name its session partition, so the isolation boundary is one key and one partition id shared by all three subsystems.
 
 ## BILL OF MATERIALS
 
 | Part | Name | Kind | Responsibility | Deps | Ref |
 |------|------|------|----------------|------|-----|
 | P1 | workspace-schema | module | Defines and validates the Workspace record, its credential scope and budget fields, and its lifecycle states and transitions. | none | local |
-| P2 | workspace-store | store | Owns workspace lifecycle: creates, opens, archives, and deletes workspaces and maps each to exactly one encrypted partition. | P1, P3 | local |
+| P2 | workspace-store | store | Owns workspace lifecycle: creates, opens, archives, and deletes workspaces and maps each to exactly one encrypted partition. | P1, P3, P4, P5, P6, P8 | local |
 | P3 | key-provisioner | module | Derives a deterministic per-workspace data key and partition id from a master keyring and zeroizes them on delete. | none | local |
 | P4 | episodic-store | store | Holds trajectories and their outcomes for one workspace, encrypted, with an embedding column per episode. | P3 | local |
 | P5 | entity-graph | store | Holds the entities the user tracks and the edges between them for one workspace, encrypted, with an embedding column per entity. | P3 | local |
@@ -69,7 +69,7 @@ Orchestration and the interface create, open, archive, and delete workspaces thr
 
 ### P1 — workspace-schema
 
-The Workspace record is the unit of persistence: a goal, the pages and artifacts attached to it, a pointer to its agent memory partition, a credential scope, and a budget. The scope and budget are fields, not stores — the vault (DO-012) and the budget manager (DO-020) read them; this sheet never holds the credentials themselves.
+The Workspace record is the unit of persistence: a goal, a pointer to its agent memory partition, a credential scope, and a budget. Pages and artifacts named in the arch-doc L3 responsibility are held elsewhere and are out of scope for this sheet. The scope and budget are fields, not stores — the vault (DO-012) and the budget manager (DO-020) read them; this sheet never holds the credentials themselves.
 
 ```mermaid
 classDiagram
@@ -273,7 +273,6 @@ classDiagram
     class LedgerEntry {
         +seq: int
         +ts: iso8601
-        +origin: string
         +amount_minor: int
         +currency: string
         +ref: uuid
@@ -377,7 +376,7 @@ Boundary contracts (external actors; this sheet owns these obligations, DO-012, 
 | 80 | Implement P8 budget-ledger inside the partition: scope and caps read, append-only debit, month sum. | language stdlib, SQLite, unit test runner | caps and scope equal the stored record; debit is append-only and monotonic; the month sum is exact to the minor unit and independent of read order. |
 | 90 | Isolation, encryption, and deletion battery across all partitions with an adversarial cross-workspace harness. | fault-injection harness, on-disk inspector, unit test runner | No store returns a row from another workspace across episodic, entity, skill, and budget reads; delete zeroizes the key and renders the partition unreadable; no partition file carries plaintext; no partition is reachable without an open handle. |
 | 100 | Local-first inspection with a network monitor around a full workspace session. | egress monitor, unit test runner | A create-open-write-read-archive session emits zero store-originated network egress; every data file resides under the local data directory. |
-| 110 | Latency and throughput measurement over reference corpora. | benchmark harness with high-resolution clock measurement | p99 measured at or below budget: vector search 50 ms on 100000-row partitions; workspace open and month-sum read observed within budget under load. |
+| 110 | Latency and throughput measurement over reference corpora. | benchmark harness with high-resolution clock measurement | p99 measured at or below budget: vector search 50 ms on 100000-row partitions. |
 
 ## REVISION HISTORY
 

@@ -114,18 +114,21 @@ validate(graph):
 flowchart TB
     IN["TaskGraph plus checkpoint state"] --> SAT["for each step, read its latest checkpoint"]
     SAT --> PRE["a predecessor is satisfied when its checkpoint is succeeded and its output port is materialized"]
-    PRE --> RDY["ready set: steps with all predecessors satisfied and no terminal checkpoint"]
+    PRE --> RDY["ready set: steps with all predecessors satisfied and no terminal checkpoint, terminal meaning failed, skipped, or a honored succeeded checkpoint"]
     RDY --> ORD["order the ready set ascending by step_id"]
     ORD --> OUT["next ready step, or none"]
 ```
 
-The scheduler is a pure function of the graph and the checkpoint state; it holds no mutable run state. A step is ready when every incoming edge's source step holds a succeeded checkpoint whose named output port is materialized, and the step itself holds no terminal checkpoint (succeeded, failed, or skipped). Ties break on ascending `step_id`, so the schedule is deterministic and replayable. `next` returns none only when no step is ready, which distinguishes a completed graph from one blocked on a failed predecessor by inspecting whether every step holds a terminal checkpoint.
+The scheduler is a pure function of the graph and the checkpoint state; it holds no mutable run state. A step is ready when every incoming edge's source step holds a succeeded checkpoint whose named output port is materialized, and the step itself holds no terminal checkpoint. A checkpoint is terminal when it is failed or skipped, or when it is a succeeded checkpoint that is honored — its `input_digest` still equals the step's resolved input digest. A succeeded checkpoint gone stale, whose upstream changed so the digest no longer matches, is not terminal, so the step re-enters the ready set and re-runs. Ties break on ascending `step_id`, so the schedule is deterministic and replayable. `next` returns none only when no step is ready, which distinguishes a completed graph from one blocked on a failed predecessor by inspecting whether every step holds a terminal checkpoint.
 
 ```text
 ready_set(graph, checkpoints):
  1. ready := []
  2. LOOP over steps in the graph:
-      IF checkpoints.latest(step) is terminal: continue
+      cp := checkpoints.latest(step)
+      IF cp status is failed or skipped: continue
+      IF cp status is succeeded AND
+         checkpoints.honored(step, resolve_inputs(step, checkpoints)): continue
       IF every incoming edge source holds a succeeded checkpoint
          with the referenced output port materialized:
            append step to ready
@@ -236,22 +239,24 @@ stateDiagram-v2
     Done --> [*]
 ```
 
-The resume-controller is the run driver. On start it loads the checkpoints and the run-log for the workspace and reconstructs run state; a fresh workspace reconstructs to an empty state. It then loops: it asks the scheduler for the next ready step, calls the dispatcher, writes the resulting checkpoint durably, and appends the lifecycle event to the log before advancing. A step whose checkpoint is honored is skipped, so no completed step re-executes across a resume. A consequential step whose log holds a pre-dispatch record but no settle record is in-doubt: the controller halts that branch and never auto-resubmits, because a duplicated payment or send is worse than a stall. Replay reads the log in order and reconstructs the sequence of steps, chosen strategies, and recorded outputs without any side-effecting call.
+The resume-controller is the run driver. On start it loads the checkpoints and the run-log for the workspace and reconstructs run state; a fresh workspace reconstructs to an empty state. It then loops: it asks the scheduler for the next ready step, calls the dispatcher, writes the resulting checkpoint durably, and appends the lifecycle event to the log before advancing. A step whose checkpoint is honored is skipped, so no completed step re-executes across a resume. The settle record is the `step.succeeded` or `step.failed` entry appended after a step's dispatch. A consequential step, navigate or fill, whose log holds a pre-dispatch record but no settle record is in-doubt: the controller halts that branch and never auto-resubmits, because a duplicated payment or send is worse than a stall. A perception or compare step interrupted mid-dispatch carries no pre-dispatch record and simply re-runs, since re-reading is safe. Replay reads the log in order and reconstructs the sequence of steps, chosen strategies, and recorded outputs without any side-effecting call.
 
 ```text
 run(graph, request):
  1. checkpoints, log := load(request.workspace_id)
- 2. LOOP:
- 3.   step := scheduler.next(graph, checkpoints)
- 4.   IF step is none: RETURN outcome(graph, checkpoints)
- 5.   IF checkpoints.honored(step, resolve_inputs(step, checkpoints)):
- 6.     append step.skipped; continue
- 7.   IF log shows step pre-dispatched without settle:
- 8.     append step.in_doubt; RETURN halt(step)
- 9.   append step.pre_dispatch durable
-10.   result := dispatcher.dispatch(step, resolve_inputs(step, checkpoints))
-11.   checkpoints.write(checkpoint(step, result), durable: true)
-12.   append step.settled with result
+ 2. LOOP over steps whose checkpoint is honored: append step.skipped
+ 3. LOOP:
+ 4.   step := scheduler.next(graph, checkpoints)
+ 5.   IF step is none: RETURN outcome(graph, checkpoints)
+ 6.   inputs := resolve_inputs(step, checkpoints)
+ 7.   IF step.kind is navigate or fill:
+ 8.     IF log shows step pre-dispatched without a settle record:
+ 9.       append step.in_doubt; RETURN halt(step)
+10.     append step.pre_dispatch durable
+11.   result := dispatcher.dispatch(step, inputs)
+12.   checkpoints.write(checkpoint(step, result), durable: true)
+13.   IF result is succeeded: append step.succeeded
+14.   ELSE: append step.failed
 ```
 
 ```text
@@ -358,7 +363,7 @@ Consumed boundaries (external subsystems; only the interface this executor calls
 | DO-013 snapshot(handle), observe(handle) | perception and verify-read steps | The dispatcher reads the PageGraph and navigation events. | Read-only; no act-class call from this subsystem; exact | Op 50 | A mutating call is rejected at inspection. |
 | DO-017 call(role, inputs) | compare, gap-patch, and full-model steps | The dispatcher routes the model role and records the output in the checkpoint and log. | Model outputs recorded at first execution and reused on replay; replay issues zero model calls; exact | Op 50, Op 80 | A fresh model call during replay is rejected at inspection. |
 | DO-018 lookup_exact, lookup_nearest | strategy resolution | Returns an exact skill, a nearest skill, or none, pinned to a snapshot ref. | Resolution deterministic for a fixed snapshot_ref; exact | Op 50, Op 80 | Nondeterministic resolution is rejected at inspection. |
-| DO-019 put(key, bytes, durable), append(key, bytes) | checkpoint and run-log persistence | Durable per-workspace key-value and append storage. | Writes scoped to one workspace partition; durable put and append flushed before ack; exact | Op 20, Op 30 | A cross-workspace read or an unflushed durable write is rejected at inspection. |
+| DO-019 put(key, bytes, durable), append(key, bytes) | checkpoint and run-log persistence | Durable per-workspace key-value and append storage. | Durable put and append flushed before ack; exact | Op 20, Op 30 | An unflushed durable write is rejected at inspection. |
 
 ## PROCESS PLAN
 

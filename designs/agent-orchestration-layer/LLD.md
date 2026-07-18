@@ -34,10 +34,11 @@ flowchart TB
     USER -->|define trigger| P4
     P1 -->|reserve slice| P3
     P1 -->|N sub-agent DAGs| DAG
-    DAG -->|partial results| P2
-    P2 -->|verified artifact| USER
-    P3 -->|read month spend| LEDGER
-    P3 -->|read cost meter| ROUTER
+    DAG -->|partial results| P1
+    P1 -->|merge and verify| P2
+    P1 -->|verified artifact| USER
+    P3 -->|read month spend and cap| LEDGER
+    P2 -->|verify role| ROUTER
     P3 -->|caps and human gate| ACP
     P5 -->|read due triggers| P4
     P5 -->|fired trigger| P6
@@ -46,7 +47,7 @@ flowchart TB
     P6 -->|run state| P4
 ```
 
-A research task enters the fanout-scheduler, which reserves a budget slice from the budget-manager, partitions the page set into N disjoint sub-agent DAGs, and submits them to the task DAG executor; the executor's partial results return to the merge-verifier, which merges and verifies them into one artifact for the user. The budget-manager reads month-to-date spend from the ledger and the token-to-money rate from the model router, and coordinates monetary caps and the human gate with the action control plane. A user-defined trigger persists in the trigger-store; the trigger-engine reads due triggers, fires on a schedule or a matched event, and hands each firing to the background-runner, which reserves a budget, runs the task through the fanout-scheduler or the executor, and records run state back to the trigger-store.
+A research task enters the fanout-scheduler, which reserves a budget slice from the budget-manager, partitions the page set into N disjoint sub-agent DAGs, and submits them to the task DAG executor; the executor's partial results return to the fanout-scheduler, which drives the merge-verifier and returns the one verified artifact to the user. The merge-verifier draws an independent verify role from the model router. The budget-manager reads month-to-date spend and the workspace budget cap from the ledger, and coordinates monetary caps and the human gate with the action control plane. A user-defined trigger persists in the trigger-store; the trigger-engine reads due triggers, fires on a schedule or a matched event, and hands each firing to the background-runner, which reserves a budget, runs the task through the fanout-scheduler or the executor, and records run state back to the trigger-store.
 
 ## BILL OF MATERIALS
 
@@ -54,10 +55,10 @@ A research task enters the fanout-scheduler, which reserves a budget slice from 
 |------|------|------|----------------|------|-----|
 | P1 | fanout-scheduler | module | Partitions a research task into N disjoint sub-agent DAGs, dispatches them for parallel execution, and drives the merge and verify step. | P2, P3 | local |
 | P2 | merge-verifier | module | Collapses N partial results into one artifact by claim key and runs an independent verify pass over the merged claims. | none | local |
-| P3 | budget-manager | class | Enforces per-task token, time, and money ceilings, reading the ledger and cost meter and deferring every transact authorization to the action control plane. | none | local |
+| P3 | budget-manager | class | Enforces per-task token, time, and money ceilings, reading the ledger and deferring every transact authorization to the action control plane. | none | local |
 | P4 | trigger-store | store | Persists trigger definitions, schedules, and run records durably across restarts. | none | local |
-| P5 | trigger-engine | module | Evaluates schedules and subscribed events and fires a trigger when its condition is due. | P4 | local |
-| P6 | background-runner | module | Wakes on a fired trigger, runs its task under a reserved budget, and records the outcome. | P1, P3, P4, P5 | local |
+| P5 | trigger-engine | module | Evaluates schedules and subscribed events and fires a trigger when its condition is due. | P4, P6 | local |
+| P6 | background-runner | module | Wakes on a fired trigger, runs its task under a reserved budget, and records the outcome. | P1, P3, P4 | local |
 
 ## DETAIL DRAWINGS
 
@@ -66,7 +67,7 @@ A research task enters the fanout-scheduler, which reserves a budget slice from 
 ```mermaid
 flowchart TB
     IN["research task plus fan-out width N"] --> PART["partition page set into N disjoint workloads"]
-    PART --> RES["reserve one budget slice per sub-agent from P3"]
+    PART --> RES["reserve one task budget slice from P3, split into a nonzero per-sub-agent sub-slice"]
     RES --> DISP["dispatch N sub-agent DAGs to the executor"]
     DISP --> WAIT["await partials; a budget-exhausted sub-agent returns a gap marker"]
     WAIT --> MV["hand partials to P2 merge-verifier"]
@@ -88,14 +89,16 @@ partition(task, N):
 
 ```text
 fan_out(task, buckets):
- 1. slice := budget_manager.reserve(task.id, task.ceiling, per_agent_request(buckets))
- 2. IF slice is denied: RETURN halt(ceiling_reached)
- 3. handles := []
- 4. LOOP over buckets as b with its sub-slice s:
+ 1. total_request := sum over buckets as b of bucket_request(b)    proportional to bucket page count
+ 2. slice := budget_manager.reserve(task.id, task.workspace, task.ceiling, total_request)
+ 3. IF slice is denied: RETURN halt(ceiling_reached)
+ 4. handles := []
+ 5. LOOP over buckets as b:
+      s := split_slice(slice, b, buckets)    sub-slice proportional to b page count, never zero since every bucket holds at least one page, and the sub-slices sum to slice
       dag := build_subagent_dag(task, b)
       handles.append(executor.submit(dag, budget_hook: s))
- 5. partials := await_all(handles)     a sub-agent that exhausts s returns a gap marker
- 6. RETURN merge_verifier.run(partials)
+ 6. partials := await_all(handles)     a sub-agent that exhausts s returns a gap marker
+ 7. RETURN merge_verifier.run(partials)
 ```
 
 ### P2 — merge-verifier
@@ -135,7 +138,7 @@ verify(artifact):
 ```mermaid
 classDiagram
     class BudgetManager {
-        +reserve(task_id, ceiling, request) Reservation
+        +reserve(task_id, workspace, ceiling, request) Reservation
         +commit(reservation, actual) LedgerView
         +release(reservation) void
         +remaining(task_id) Ceiling
@@ -163,14 +166,14 @@ A reservation is granted only when the sum of live reservations plus the request
 The money ceiling bounds only the maximum a task may attempt; it authorizes no spend. Every monetary action a sub-agent takes is submitted by the executor to the action control plane, which applies its own per-workspace caps and its human gate. The budget-manager emits no approval and holds no capability token, so a lower ceiling can only shrink what a task may request and never raises a cap or replaces the gate.
 
 ```text
-reserve(task_id, ceiling, request):
+reserve(task_id, workspace, ceiling, request):
  1. live := sum_live_reservations(task_id)
  2. IF live.tokens + request.tokens > ceiling.tokens: RETURN deny(TOKEN_CEILING)
  3. IF live.seconds + request.seconds > ceiling.seconds: RETURN deny(TIME_CEILING)
- 4. spent := ledger.month_spent(task.workspace)
+ 4. spent := ledger.month_spent(workspace)
  5. projected := live.money + request.money_max
  6. IF projected > ceiling.money_minor: RETURN deny(MONEY_CEILING)
- 7. IF spent + projected > policy_cap(task.workspace): RETURN deny(MONEY_CEILING)
+ 7. IF spent + projected > ledger.workspace_cap(workspace): RETURN deny(MONEY_CEILING)
  8. res := record_reservation(task_id, request)
  9. RETURN grant(res)    a grant bounds spend; it authorizes no transact
 ```
@@ -208,7 +211,7 @@ classDiagram
     TriggerStore --> RunRecord
 ```
 
-Enums, closed: `TriggerKind` = scheduled, event. `TriggerState` = armed, firing, running, paused, expired. `RunState` = started, denied, done, failed. A `put` or `update` returns only after the record is durable on disk, so an acknowledged trigger survives a process restart. `load_armed` returns every trigger in state armed with its `next_fire_at`; on restart the store recomputes `next_fire_at` from the schedule and the current time before returning. Run records are append-only per trigger and ordered by firing, so the run history is a faithful log.
+Enums, closed: `TriggerKind` = scheduled, event. `TriggerState` = armed, firing, paused, expired. `RunState` = started, denied, done. A `put` or `update` returns only after the record is durable on disk, so an acknowledged trigger survives a process restart. `load_armed` returns every trigger in state armed with its `next_fire_at`; on restart the store recomputes `next_fire_at` from the schedule and the current time before returning. Run records are append-only per trigger and ordered by firing, so the run history is a faithful log.
 
 ### P5 — trigger-engine
 
@@ -218,22 +221,21 @@ stateDiagram-v2
     Armed --> Firing: schedule due or event matched
     Armed --> Paused: user pauses
     Armed --> Expired: end date reached
-    Firing --> Running: background-runner wakes
-    Running --> Armed: run done, next_fire_at advanced
+    Firing --> Armed: run done, next_fire_at advanced
     Paused --> Armed: user resumes
     Expired --> [*]
 ```
 
-The engine ticks on the injected clock. A scheduled trigger fires once its `next_fire_at` is at or before now; the engine advances `next_fire_at` to the next scheduled instant strictly after now in the same step, so a downtime that spans several scheduled instants coalesces to exactly one fire rather than a burst. An event trigger fires once per matching subscribed event and never on a non-match. A trigger in state paused or expired never fires. A firing transitions the trigger to state firing and enqueues it for the background-runner.
+The engine ticks on the injected clock and a drained batch of subscribed events. A scheduled trigger fires once its `next_fire_at` is at or before now; the engine advances `next_fire_at` to the next scheduled instant strictly after now in the same step, so a downtime that spans several scheduled instants coalesces to exactly one fire rather than a burst. An event trigger fires once per matching subscribed event and never on a non-match. A trigger in state paused or expired never fires. A firing transitions the trigger to state firing and enqueues it for the background-runner.
 
 ```text
-tick(now):
+tick(now, events):
  1. fired := []
  2. LOOP over trigger_store.load_armed() as t:
       IF t.kind is scheduled AND now >= t.next_fire_at:
         t.next_fire_at := next_after(t.schedule, now)    coalesces missed instants
         fired.append(t)
-      ELSE IF t.kind is event AND event_matched(t, now):
+      ELSE IF t.kind is event AND event_matched(t, events):
         fired.append(t)
  3. LOOP over fired as t:
       trigger_store.update(t, state: FIRING)
@@ -276,7 +278,7 @@ run(t):
  1. IF trigger_store.has_active_run(t.id): RETURN skip(already_running)
  2. run_id := new_run_id()
  3. trigger_store.record_run(t.id, run_id, state: STARTED)
- 4. slice := budget_manager.reserve(t.id, t.ceiling, t.request)
+ 4. slice := budget_manager.reserve(t.id, t.workspace_id, t.ceiling, t.request)
  5. IF slice is denied:
       trigger_store.record_run(t.id, run_id, state: DENIED)
       RETURN halt(ceiling_reached)
@@ -310,7 +312,7 @@ P3 — budget-manager:
 
 | Operation | Input domain | Nominal behavior | Tolerance | Inspection op | Failure mode outside tolerance |
 |-----------|--------------|------------------|-----------|---------------|--------------------------------|
-| reserve(task_id, ceiling, request) | a per-task ceiling on tokens, seconds, and money; a sub-request | Grants a reservation when cumulative reserved plus request stays within every ceiling axis; else denies with the breached axis. | Sum of live reservations never exceeds any ceiling axis; concurrent reserves never collectively exceed a ceiling; exact | Op 20 | A reservation past a ceiling overspends; a stress harness of concurrent reserves asserts the invariant holds. |
+| reserve(task_id, workspace, ceiling, request) | a workspace; a per-task ceiling on tokens, seconds, and money; a sub-request | Grants a reservation when cumulative reserved plus request stays within every ceiling axis; else denies with the breached axis. | Sum of live reservations never exceeds any ceiling axis; concurrent reserves never collectively exceed a ceiling; exact | Op 20 | A reservation past a ceiling overspends; a stress harness of concurrent reserves asserts the invariant holds. |
 | commit(reservation, actual), release(reservation) | a granted reservation and its measured actual | Debits the actual to the ledger view and returns the unused remainder. | Committed plus released equals reserved, exact to the minor unit and the token | Op 20 | Arithmetic drift leaks or overcounts budget; inspection sums reservations against commits and releases. |
 | money-ceiling rule | any monetary sub-action under a ceiling | Bounds the maximum a task may request; issues no authorization and holds no capability token. | Budget-manager emits zero transact authorizations; every monetary action still routes to the action control plane human gate regardless of headroom; exact | Op 20, Op 80 | A ceiling that authorized spend would bypass the gate; the Op 80 battery asserts the gate fires on every transact. |
 | month-spend read | a monetary request | Reads the ledger's month-to-date spend live at reservation time before granting. | A reservation is refused when month spend plus projection exceeds the workspace cap; the read is never cached past the reservation; exact | Op 20, Op 80 | A stale read admits spend past the cap; inspection mutates the ledger between reservations and asserts refusal. |
@@ -328,7 +330,7 @@ P5 — trigger-engine:
 
 | Operation | Input domain | Nominal behavior | Tolerance | Inspection op | Failure mode outside tolerance |
 |-----------|--------------|------------------|-----------|---------------|--------------------------------|
-| tick(now) | the injected clock; armed triggers | Fires each scheduled trigger due at or before now and each event trigger whose subscription matches. | A due scheduled trigger fires at or after next_fire_at and before the following tick; no armed scheduled fire is skipped; exact | Op 50 | A skipped fire drops a briefing; inspection advances a fake clock across due instants and counts fires. |
+| tick(now, events) | the injected clock; a drained subscribed-event batch; armed triggers | Fires each scheduled trigger due at or before now and each event trigger whose subscription matches. | A due scheduled trigger fires at or after next_fire_at and before the following tick; no armed scheduled fire is skipped; exact | Op 50 | A skipped fire drops a briefing; inspection advances a fake clock across due instants and counts fires. |
 | catch-up on downtime | a downtime spanning several scheduled instants | Fires once and advances next_fire_at strictly past now. | Missed scheduled instants during downtime coalesce to exactly one fire; exact | Op 50, Op 90 | A burst of catch-up fires floods the runner; inspection simulates downtime and asserts a single fire. |
 | event match | a subscribed event | Fires once per matching event; ignores non-matching events. | One fire per matching event; zero fires on non-match; a paused or expired trigger never fires; exact | Op 50 | A spurious or missing event fire runs the wrong task; inspection replays matching and non-matching events. |
 
@@ -346,8 +348,8 @@ External boundaries (unnumbered actors; DO-020 consumes these interfaces and nev
 | Operation | Input domain | Nominal behavior | Tolerance | Inspection op | Failure mode outside tolerance |
 |-----------|--------------|------------------|-----------|---------------|--------------------------------|
 | executor.submit(dag, budget_hook) — DO-016 | a sub-agent or task DAG; a reserved slice | Runs the DAG with checkpoints and reports consumed tokens and time to the budget hook per step. | A step whose reserved slice is exhausted halts and returns a gap marker; the runner touches pages only through the executor; exact | Op 40, Op 70 | An unmetered step overspends; the stub executor asserts every step reports to its slice. |
-| ledger.month_spent(workspace) — DO-019 | an open workspace | Returns the month-to-date committed spend for the workspace. | Read exact to the minor unit; DO-020 reads the ledger and never writes it; exact | Op 20, Op 80 | A wrong or writable ledger view breaks the cap check; inspection asserts read-only access and a matching sum. |
-| router.cost_meter(role), router.verify_role() — DO-017 | a model role | Returns the token-to-money rate for a role and a verify role distinct from producing roles. | Rate exact per role; verify role never equals a producing role in the same fan-out; exact | Op 30 | A same-model verify passes the work it produced; inspection asserts role distinctness on a fan-out fixture. |
+| ledger.month_spent(workspace), ledger.workspace_cap(workspace) — DO-019 | an open workspace | Returns the month-to-date committed spend and the workspace budget cap for the workspace. | Read exact to the minor unit; DO-020 reads the ledger and never writes it; exact | Op 20, Op 80 | A wrong or writable ledger view breaks the cap check; inspection asserts read-only access and a matching sum. |
+| router.verify_role() — DO-017 | a model role | Returns a verify role distinct from producing roles. | Verify role never equals a producing role in the same fan-out; exact | Op 30 | A same-model verify passes the work it produced; inspection asserts role distinctness on a fan-out fixture. |
 | acp.submit(proposal) — DO-012 | any consequential action a background task takes | Applies policy, per-workspace spend caps, and the human gate to every action. | No orchestrated action reaches RenderSurface except through DO-016 and DO-012; every transact-tier action hits the human gate regardless of budget headroom; exact | Op 80 | A budget-headroom bypass would auto-transact; the Op 80 battery asserts the gate fires on every transact-tier action. |
 
 ## PROCESS PLAN
@@ -355,7 +357,7 @@ External boundaries (unnumbered actors; DO-020 consumes these interfaces and nev
 | Op | Task | Tooling | Inspection |
 |----|------|---------|------------|
 | 10 | Implement P4 trigger-store: durable records, load_armed, append-only run history. | language stdlib, key-value or file store, unit test runner | Write triggers, kill the process, reload; every armed trigger survives with next_fire_at recomputed; run records stay append-only and ordered. |
-| 20 | Implement P3 budget-manager: token, time, and money ceilings, reserve, commit, release, over stub ledger and cost meter. | language stdlib, unit test runner | Reserve within ceiling grants and over ceiling denies with the breached axis; concurrent reserves never exceed a ceiling; committed plus released equals reserved; the money path emits no authorization. |
+| 20 | Implement P3 budget-manager: token, time, and money ceilings, reserve, commit, release, over a stub ledger. | language stdlib, unit test runner | Reserve within ceiling grants and over ceiling denies with the breached axis; concurrent reserves never exceed a ceiling; committed plus released equals reserved; the money path emits no authorization. |
 | 30 | Implement P2 merge-verifier over recorded partial-result fixtures. | language stdlib, fixture corpus, unit test runner | Identical partials in any order give a byte-identical artifact; duplicates collapse with unioned sources; a seeded unsupported claim is flagged and not dropped; the verify role differs from the producing role. |
 | 40 | Implement P1 fanout-scheduler over a stub executor. | language stdlib, stub executor harness, unit test runner | Partition covers every page once with no overlap; N sub-agent DAGs dispatched, each with a nonzero slice summing within the ceiling; an incomplete bucket yields a gap marker; merge and verify are invoked. |
 | 50 | Implement P5 trigger-engine: scheduled and event evaluation on a fake clock and stub event source. | language stdlib, fake clock, unit test runner | A scheduled trigger fires at its due instant; downtime across instants coalesces to one fire; an event fires once per match and never on non-match; paused and expired triggers never fire. |

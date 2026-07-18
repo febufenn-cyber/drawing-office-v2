@@ -40,14 +40,15 @@ flowchart TB
     RP -->|pools| IG
     D -->|workspace, provider| KS
     WS -->|workspace key| KS
-    D -->|binding, key, prompt| PA
+    D -->|binding, handle, prompt| PA
+    PA -->|resolve handle| KS
     PA -->|prompt| MP
     RP -->|price table| CM
     D -->|usage| CM
     CM -->|cost record| BM
 ```
 
-A caller — the task DAG executor or the skill compiler — submits a typed RouteRequest naming a role and a prompt bundle to the route-dispatcher, the single entry point. The dispatcher has the role-classifier resolve the role to a model class, asks the routing-policy to select a concrete model binding from that class pool, and for a verification request first excludes the producing model through the independence-guard so the verifier is never the producer. It draws the provider key for that binding from the key-store, which holds BYO keys encrypted under a per-workspace key from the workspace store, then forwards the prompt through the provider-adapter to the external provider. The cost-meter prices the returned usage against the policy price table and reports a cost record to the budget manager. Prompt content and provider keys are forwarded, never inspected or returned; the router selects providers and meters spend and owns no site credential.
+A caller — the task DAG executor or the skill compiler — submits a typed RouteRequest naming a role and a prompt bundle to the route-dispatcher, the single entry point. The dispatcher has the role-classifier resolve the role to a model class, asks the routing-policy to select a concrete model binding from that class pool, and for a verification request first excludes the producing model through the independence-guard so the verifier is never the producer. It draws a key handle for that binding from the key-store, which holds BYO keys encrypted under a per-workspace key from the workspace store, then forwards the prompt with that handle through the provider-adapter, which resolves the handle to key material at transport, to the external provider. The cost-meter prices the returned usage against the policy price table and reports a cost record to the budget manager. Prompt content and provider keys are forwarded, never inspected or returned; the router selects providers and meters spend and owns no site credential.
 
 ## BILL OF MATERIALS
 
@@ -74,7 +75,6 @@ classDiagram
         +pools: map ModelClass to list of ModelBinding
         +prices: map model_id to PriceEntry
         +independence_axis: Axis
-        +currency: string
         +provider_timeout_ms: int
     }
     class ModelBinding {
@@ -115,11 +115,11 @@ Load refusals, fail-closed: an empty pool for any class named by `role_class`; a
 flowchart TB
     IN["RouteRequest role"] --> CHK{"role in plan, extract, classify, verify"}
     CHK -->|no| REJ["reject: invalid_request"]
-    CHK -->|yes AND role is verify| VER["class := producer_tag.model_class"]
+    CHK -->|yes AND role is verify| VER["verify: class deferred to dispatcher"]
     CHK -->|yes AND role not verify| MAP["class := policy.role_class[role]"]
 ```
 
-The classifier is a total function over the closed role set; an out-of-enum role is rejected rather than defaulted. The fixed map is plan to frontier, extract to fast, classify to fast. Verify is the one role whose class is not fixed by role: it inherits the producing model class carried in the producer tag, so verification runs at the capability of the work it checks. Classification is deterministic and holds no state.
+The classifier is a total function over the closed role set; an out-of-enum role is rejected rather than defaulted. The fixed map is plan to frontier, extract to fast, classify to fast. Verify is the one role the classifier does not assign a class: the classifier admits it, and the dispatcher sets its class from the producer tag it carries, so verification runs at the capability of the work it checks. Classification is deterministic and holds no state.
 
 ### P3 — key-store
 
@@ -165,7 +165,7 @@ sequenceDiagram
     A-->>D: Completion, Usage
 ```
 
-The adapter normalizes heterogeneous provider APIs into one Completion and Usage shape, so no other part branches on provider identity. The prompt bundle is forwarded to the provider body unmodified; the resolved key is placed only in the transport authorization header, never in the request body, the returned Completion, a log line, or a cost record. `Usage` carries input_tokens, output_tokens, and cached_tokens read from the provider response. A call that exceeds `provider_timeout_ms` is abandoned and returned as a provider_error; the adapter invents no token counts for a failed call.
+The adapter normalizes heterogeneous provider APIs into one Completion and Usage shape, so no other part branches on provider identity. The prompt bundle is forwarded to the provider body unmodified; the resolved key is placed only in the transport authorization header, never in the request body, the returned Completion, a log line, or a cost record. `Usage` carries input_tokens and output_tokens read from the provider response; any cached tokens the provider reports are already counted within input_tokens and billed at the input rate. A call that exceeds `provider_timeout_ms` is abandoned and returned as a provider_error; the adapter invents no token counts for a failed call.
 
 ### P5 — independence-guard
 
@@ -324,7 +324,7 @@ P2 — role-classifier:
 
 | Operation | Input domain | Nominal behavior | Tolerance | Inspection op | Failure mode outside tolerance |
 |-----------|--------------|------------------|-----------|---------------|--------------------------------|
-| classify(role) | one Role value, possibly out of enum | Maps plan to frontier, extract and classify to fast, and verify to the producer tag class; rejects an unknown role. | Total and deterministic over the closed role set; exact | Op 20 | An out-of-enum role is rejected as invalid_request, never defaulted to a class. |
+| classify(role) | one Role value, possibly out of enum | Maps plan to frontier, extract and classify to fast, and admits verify with its class deferred to the dispatcher, which sets it from the producer tag; rejects an unknown role. | Total and deterministic over the closed role set; exact | Op 20 | An out-of-enum role is rejected as invalid_request, never defaulted to a class. |
 
 P3 — key-store:
 
