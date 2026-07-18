@@ -19,26 +19,32 @@ imports engine or Electron code.** Perception and action cross the
 | DO-013 | Render Surface Engine Boundary | L0 | Own the engine; expose pages only through RenderSurface. | none | drafted |
 | DO-014 | PageGraph Perception Model | L1 | Turn any page into typed, stable-id structured data and affordances. | DO-013 | drafted |
 | DO-015 | Site Adapter Compiler | L1 | Compile an origin into typed, self-testing tools with provenance. | DO-013, DO-014, DO-017 | drafted |
-| DO-016 | Task DAG Executor | L2 | Execute task graphs with per-step checkpoints and crash-resume. | DO-012, DO-013, DO-019 | drafted |
-| DO-017 | Model Router | L2 | Route each role to a model; hold BYO keys; keep the verifier independent. | DO-019 | drafted |
+| DO-016 | Task DAG Executor | L2 | Execute task graphs with per-step checkpoints and crash-resume. | DO-012, DO-013, DO-017, DO-018, DO-019 | drafted |
+| DO-017 | Model Router | L2 | Route each role to a model; hold BYO keys; keep the verifier independent. | DO-019, DO-020 | drafted |
 | DO-018 | Skill Compiler and Library | L2 | Compile successful trajectories into verified, replayable skills. | DO-013, DO-016, DO-017, DO-019 | drafted |
 | DO-019 | Workspace and Memory Store | L3 | Persist workspaces and the episodic, entity, and skill stores, encrypted and partitioned. | none | drafted |
-| DO-020 | Agent Orchestration Layer | L5 | Fan out agents, enforce budgets, and run scheduled and event triggers. | DO-016, DO-019 | drafted |
+| DO-020 | Agent Orchestration Layer | L5 | Fan out agents, enforce budgets, and run scheduled and event triggers. | DO-012, DO-016, DO-017, DO-019 | drafted |
 | DO-021 | Interface Shell | L6 | Intent box, task cards, approval sheet, ambient sidebar. | DO-012, DO-016, DO-019 | drafted |
 
 ## Manufacture order
 
-The build order is a topological sort of the dependency column: a subsystem
-is manufactured only after every subsystem it depends on is accepted per its
+The build order is a topological sort of the dependency column, with two
+runtime feedback edges broken by stubs: DO-016 and DO-018 depend on each
+other (the executor runs skills; the skill compiler generalizes the
+executor's trajectories), and DO-017 and DO-020 depend on each other (the
+router reports cost to the budget manager; the budget manager reads the
+router's rates). Each pair is built by standing the second side up against a
+stub of the first, then completing the loop. A subsystem is otherwise
+manufactured only after every subsystem it depends on is accepted per its
 own drawing.
 
 1. DO-013 Render Surface Engine Boundary
 2. DO-019 Workspace and Memory Store
 3. DO-014 PageGraph Perception Model
-4. DO-017 Model Router
+4. DO-017 Model Router (against a DO-020 budget-manager stub)
 5. DO-012 Browser OS Action Control Plane
 6. DO-015 Site Adapter Compiler
-7. DO-016 Task DAG Executor
+7. DO-016 Task DAG Executor (against a DO-018 skill-library stub)
 8. DO-018 Skill Compiler and Library
 9. DO-020 Agent Orchestration Layer
 10. DO-021 Interface Shell
