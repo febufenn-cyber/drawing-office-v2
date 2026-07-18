@@ -19,6 +19,8 @@ The validator checks form, never substance: sections, title block, BOM and
 part-count agreement, tolerance and inspection-op coverage, and the
 derived-drawing evidence rules. Whether a tolerance is the right one is
 established by review and by building the artifact — never by the validator.
+The validator's own fixture suite runs with `python tools/tests/run.py`;
+fixtures fail on purpose and stay out of `designs/`.
 
 ## Drawings
 
