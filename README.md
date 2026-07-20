@@ -41,3 +41,4 @@ Process Plan.
 | DO-019 Workspace and Memory Store | [`impl/workspace-and-memory-store/`](impl/workspace-and-memory-store/) | logic and AEAD-at-rest built and tested; SQLite/SQLCipher/sqlite-vec substrate pending |
 | DO-014 PageGraph Perception Model | [`impl/pagegraph-perception-model/`](impl/pagegraph-perception-model/) | full deterministic perception pipeline built and tested |
 | DO-017 Model Router | [`impl/model-router/`](impl/model-router/) | full router with verifier independence built and tested; providers and DO-020 budget manager behind stubs |
+| DO-015 Site Adapter Compiler | [`impl/site-adapter-compiler/`](impl/site-adapter-compiler/) | full compile/replay/health/drift/hot-swap pipeline built and tested; PageGraph/RenderSurface/model-router behind interfaces |
