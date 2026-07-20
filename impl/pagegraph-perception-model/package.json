@@ -1,0 +1,15 @@
+{
+  "name": "do-014-pagegraph-perception-model",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Manufactured implementation of DO-014 PageGraph Perception Model (L1). Deterministic fusion of a render snapshot into a typed, stable-id, provenance-tagged PageGraph.",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-transform-types --test 'test/*.test.ts'"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^22.7.0"
+  }
+}
