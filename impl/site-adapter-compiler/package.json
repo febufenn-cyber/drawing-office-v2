@@ -1,0 +1,15 @@
+{
+  "name": "do-015-site-adapter-compiler",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Manufactured implementation of DO-015 Site Adapter Compiler (L1). Compiles one exploration trajectory into typed, self-testing tools that replay with no model call.",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-transform-types --test 'test/*.test.ts'"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^22.7.0"
+  }
+}
