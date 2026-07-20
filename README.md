@@ -37,3 +37,4 @@ Process Plan.
 | Drawing | Implementation | Status |
 |---------|----------------|--------|
 | DO-013 Render Surface Engine Boundary | [`impl/render-surface-engine-boundary/`](impl/render-surface-engine-boundary/) | engine-neutral core built and tested; production Electron driver pending |
+| DO-019 Workspace and Memory Store | [`impl/workspace-and-memory-store/`](impl/workspace-and-memory-store/) | logic and AEAD-at-rest built and tested; SQLite/SQLCipher/sqlite-vec substrate pending |
