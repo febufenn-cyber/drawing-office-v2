@@ -36,6 +36,7 @@ Process Plan.
 
 | Drawing | Implementation | Status |
 |---------|----------------|--------|
+| DO-012 Browser OS Action Control Plane | [`impl/browser-os-action-control-plane/`](impl/browser-os-action-control-plane/) | full authorization + evidence core with the four injection guarantees built and tested; RenderSurface/PageGraph/approval-UI behind interfaces |
 | DO-013 Render Surface Engine Boundary | [`impl/render-surface-engine-boundary/`](impl/render-surface-engine-boundary/) | engine-neutral core built and tested; production Electron driver pending |
 | DO-019 Workspace and Memory Store | [`impl/workspace-and-memory-store/`](impl/workspace-and-memory-store/) | logic and AEAD-at-rest built and tested; SQLite/SQLCipher/sqlite-vec substrate pending |
 | DO-014 PageGraph Perception Model | [`impl/pagegraph-perception-model/`](impl/pagegraph-perception-model/) | full deterministic perception pipeline built and tested |

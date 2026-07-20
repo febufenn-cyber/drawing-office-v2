@@ -1,0 +1,15 @@
+{
+  "name": "do-012-browser-os-action-control-plane",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Manufactured implementation of DO-012 Browser OS Action Control Plane (L4). Deterministic authorization and hash-chained evidence between the agent runtime and RenderSurface, with the four injection guarantees.",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-transform-types --test 'test/*.test.ts'"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^22.7.0"
+  }
+}
