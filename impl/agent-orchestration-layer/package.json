@@ -1,0 +1,15 @@
+{
+  "name": "do-020-agent-orchestration-layer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Manufactured implementation of DO-020 Agent Orchestration Layer (L5). Fans out agents under enforced per-task budgets and runs scheduled and event-driven background tasks over the task DAG executor.",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-transform-types --test 'test/*.test.ts'"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^22.7.0"
+  }
+}
