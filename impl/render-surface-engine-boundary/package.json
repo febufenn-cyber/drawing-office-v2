@@ -1,0 +1,15 @@
+{
+  "name": "do-013-render-surface-engine-boundary",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Manufactured implementation of DO-013 Render Surface Engine Boundary (L0). Engine-neutral RenderSurface contract with an in-memory stub engine that doubles as the second-driver acceptance harness.",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-transform-types --test 'test/*.test.ts'"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^22.7.0"
+  }
+}

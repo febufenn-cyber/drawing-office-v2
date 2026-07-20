@@ -24,6 +24,16 @@ fixtures fail on purpose and stay out of `designs/`.
 
 ## Drawings
 
-| Id | Title | Status |
-|----|-------|--------|
-| DO-012 | Browser OS Action Control Plane | draft |
+The subsystem design program (DO-012 through DO-021) and its register live under
+`designs/`; see [`designs/REGISTER.md`](designs/REGISTER.md) for the full L0–L6
+set, dependency graph, and manufacture order.
+
+## Implementations
+
+Code manufactured from a drawing lives under `impl/<slug>/`, separate from the
+design library. Each is built to its sheet and verified against the sheet's
+Process Plan.
+
+| Drawing | Implementation | Status |
+|---------|----------------|--------|
+| DO-013 Render Surface Engine Boundary | [`impl/render-surface-engine-boundary/`](impl/render-surface-engine-boundary/) | engine-neutral core built and tested; production Electron driver pending |
