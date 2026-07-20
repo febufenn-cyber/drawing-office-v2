@@ -1,0 +1,15 @@
+{
+  "name": "do-018-skill-compiler-and-library",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Manufactured implementation of DO-018 Skill Compiler and Library (L2). Compiles a successful trajectory into a verified, parameterized, replayable skill and manages its lifecycle.",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-transform-types --test 'test/*.test.ts'"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^22.7.0"
+  }
+}
