@@ -42,3 +42,4 @@ Process Plan.
 | DO-014 PageGraph Perception Model | [`impl/pagegraph-perception-model/`](impl/pagegraph-perception-model/) | full deterministic perception pipeline built and tested |
 | DO-017 Model Router | [`impl/model-router/`](impl/model-router/) | full router with verifier independence built and tested; providers and DO-020 budget manager behind stubs |
 | DO-015 Site Adapter Compiler | [`impl/site-adapter-compiler/`](impl/site-adapter-compiler/) | full compile/replay/health/drift/hot-swap pipeline built and tested; PageGraph/RenderSurface/model-router behind interfaces |
+| DO-016 Task DAG Executor | [`impl/task-dag-executor/`](impl/task-dag-executor/) | full checkpoint/crash-resume/replay engine with at-most-once consequential steps built and tested; control-plane/RenderSurface/model-router/skill-library/workspace-store behind interfaces |
