@@ -1,0 +1,15 @@
+{
+  "name": "do-019-workspace-and-memory-store",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Manufactured implementation of DO-019 Workspace and Memory Store (L3). Local-first, per-workspace encrypted partitions with an AEAD-at-rest partition seam; SQLite/SQLCipher/sqlite-vec are the production substrate behind it.",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-transform-types --test 'test/*.test.ts'"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^22.7.0"
+  }
+}
