@@ -39,3 +39,4 @@ Process Plan.
 | DO-013 Render Surface Engine Boundary | [`impl/render-surface-engine-boundary/`](impl/render-surface-engine-boundary/) | engine-neutral core built and tested; production Electron driver pending |
 | DO-019 Workspace and Memory Store | [`impl/workspace-and-memory-store/`](impl/workspace-and-memory-store/) | logic and AEAD-at-rest built and tested; SQLite/SQLCipher/sqlite-vec substrate pending |
 | DO-014 PageGraph Perception Model | [`impl/pagegraph-perception-model/`](impl/pagegraph-perception-model/) | full deterministic perception pipeline built and tested |
+| DO-017 Model Router | [`impl/model-router/`](impl/model-router/) | full router with verifier independence built and tested; providers and DO-020 budget manager behind stubs |
