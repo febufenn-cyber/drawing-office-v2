@@ -15,14 +15,26 @@ function byStepId(a: Step, b: Step): number {
   return a.step_id < b.step_id ? -1 : a.step_id > b.step_id ? 1 : 0;
 }
 
-export function readySet(graph: TaskGraph, checkpoints: CheckpointView): Step[] {
-  // Precompute incoming edges per step so readiness is O(V + E), not O(V * E).
-  const incoming = new Map<string, Edge[]>();
-  for (const e of graph.edges) {
-    const arr = incoming.get(e.to_step);
-    if (arr === undefined) incoming.set(e.to_step, [e]); else arr.push(e);
+// The incoming-edge index per step. A TaskGraph is immutable and the controller
+// calls the scheduler once per step over the same graph object, so the index is
+// memoized against the graph rather than rebuilt on every call — the difference
+// between O(V + E) once and O(V * (V + E)) across a full run.
+const incomingCache = new WeakMap<TaskGraph, Map<string, Edge[]>>();
+function incomingEdges(graph: TaskGraph): Map<string, Edge[]> {
+  let m = incomingCache.get(graph);
+  if (m === undefined) {
+    m = new Map();
+    for (const e of graph.edges) {
+      const arr = m.get(e.to_step);
+      if (arr === undefined) m.set(e.to_step, [e]); else arr.push(e);
+    }
+    incomingCache.set(graph, m);
   }
+  return m;
+}
 
+export function readySet(graph: TaskGraph, checkpoints: CheckpointView): Step[] {
+  const incoming = incomingEdges(graph);
   const ready: Step[] = [];
   for (const step of graph.steps) {
     const cp = checkpoints.latest(step.step_id);
